@@ -39,7 +39,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -64,7 +63,7 @@ PLOT_DIR          = Path(C.RESULTS_DIR) / "step03"
 # ── Modalità sviluppo ────────────────────────────────────────────────────
 # True  → cancella tutti i checkpoint ad ogni run (sempre da zero)
 # False → riprende da dove era rimasto (comportamento produzione)
-FRESH_START = True
+FRESH_START = False
 
 # Path dove pip installa i pacchetti di sistema sui nodi
 CUML_BASE = "/usr/local/lib/python3.12/dist-packages"
@@ -439,19 +438,13 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
         remaining  = (N_TRIALS - n_done - 1) / rate if rate > 0 else 0
         eta_str    = f"{int(remaining//60)}m{int(remaining%60):02d}s" if rate > 0 else "?"
 
+        best_str = f"best={best_dbcv:.4f}" if np.isfinite(best_dbcv) else "best=n/a"
         print(
             f"  {n_done+1:>4}/{N_TRIALS}  "
             f"nn={int(r['n_neighbors']):>3} md={float(r['min_dist']):.2f} "
             f"mcs={int(r['min_cluster_size']):>3}  "
             f"score={sc_str}  k={int(r['n_clusters']):>2}  "
-            f"noise={r['noise_frac']:>5.1%}  {bk_short}"
-            f"  best={best_dbcv:.4f}" if np.isfinite(best_dbcv) else
-            f"  {n_done+1:>4}/{N_TRIALS}  "
-            f"nn={int(r['n_neighbors']):>3} md={float(r['min_dist']):.2f} "
-            f"mcs={int(r['min_cluster_size']):>3}  "
-            f"score={sc_str}  k={int(r['n_clusters']):>2}  "
-            f"noise={r['noise_frac']:>5.1%}  {bk_short}"
-            f"  best=n/a",
+            f"noise={r['noise_frac']:>5.1%}  {bk_short}  {best_str}",
             flush=True
         )
         if is_best:
