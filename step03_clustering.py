@@ -270,25 +270,21 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
     print("  Ray connesso.", flush=True)
 
     # Aspetta che tutti i worker GPU siano disponibili (max 2 min)
-    EXPECTED_GPUS        = 3
-    EXPECTED_WORKER_CPUS = 24   # 3 worker × 8 CPU ciascuno
-    WAIT_SECS            = 120
+    EXPECTED_GPUS = 3
+    WAIT_SECS     = 120
     _t_wait = time.time()
     while True:
         _res  = ray.cluster_resources()
         _gpus = int(_res.get("GPU", 0))
-        _cpus = int(_res.get("CPU", 1)) - 1   # escludi head node
-        if _gpus >= EXPECTED_GPUS and _cpus >= EXPECTED_WORKER_CPUS:
-            print(f"  ✓ Cluster pronto: {_gpus} GPU, {_cpus} CPU worker", flush=True)
+        if _gpus >= EXPECTED_GPUS:
+            print(f"  ✓ Cluster pronto: {_gpus} GPU", flush=True)
             break
         elapsed_w = time.time() - _t_wait
         if elapsed_w >= WAIT_SECS:
             print(f"  ⚠ Timeout ({WAIT_SECS}s): cluster ha solo "
-                  f"{_gpus}/{EXPECTED_GPUS} GPU, {_cpus}/{EXPECTED_WORKER_CPUS} CPU"
-                  f" — procedo comunque.", flush=True)
+                  f"{_gpus}/{EXPECTED_GPUS} GPU — procedo comunque.", flush=True)
             break
-        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU, "
-              f"{_cpus}/{EXPECTED_WORKER_CPUS} CPU"
+        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU"
               f" — attendo... ({int(WAIT_SECS - elapsed_w)}s rimasti)", flush=True)
         time.sleep(5)
 
@@ -372,7 +368,7 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
     submitted = len(in_flight)
 
     with tqdm(total=N_TRIALS, initial=n_done, desc="  trials",
-              ncols=88, bar_format=bar_fmt) as pbar:
+              ncols=88, bar_format=bar_fmt, file=sys.stdout) as pbar:
         pbar.set_postfix(best=f"{best_dbcv:.4f}" if np.isfinite(best_dbcv) else "n/a",
                          refresh=False)
 
