@@ -729,11 +729,13 @@ def main():
                           if c.startswith("emb_")]].values.astype(np.float32)
     print(f"  {len(E_raw):,} windows × {E_raw.shape[1]:,} dims")
 
-    # PCA CPU: riduce 8448D → n componenti che spiegano PCA_VARIANCE della varianza
-    print(f"  PCA {E_raw.shape[1]}D → {PCA_VARIANCE:.0%} varianza  (CPU, sklearn)...", flush=True)
+    # StandardScaler + PCA CPU: riduce 8448D → n componenti che spiegano PCA_VARIANCE
+    print(f"  StandardScaler + PCA {E_raw.shape[1]}D → {PCA_VARIANCE:.0%} varianza  (CPU)...", flush=True)
     from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    E_scaled = StandardScaler().fit_transform(E_raw)
     pca = PCA(n_components=PCA_VARIANCE, random_state=RANDOM_STATE)
-    E   = pca.fit_transform(E_raw).astype(np.float32)
+    E   = pca.fit_transform(E_scaled).astype(np.float32)
     print(f"  → {E.shape[1]}D  ({pca.explained_variance_ratio_.sum():.1%} varianza spiegata)")
 
     # ── 2. Grid search (con resume automatico via checkpoint CSV) ────────
