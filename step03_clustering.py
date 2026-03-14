@@ -64,7 +64,7 @@ PLOT_DIR          = Path(C.RESULTS_DIR) / "step03"
 # ── Modalità sviluppo ────────────────────────────────────────────────────
 # True  → cancella tutti i checkpoint ad ogni run (sempre da zero)
 # False → riprende da dove era rimasto (comportamento produzione)
-FRESH_START = True
+FRESH_START = False
 
 # Path dove pip installa i pacchetti di sistema sui nodi
 CUML_BASE = "/usr/local/lib/python3.12/dist-packages"
