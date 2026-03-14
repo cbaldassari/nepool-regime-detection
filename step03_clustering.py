@@ -255,9 +255,14 @@ def run_one(E_pca: np.ndarray, n_neighbors: int, min_dist: float,
 #  Grid search su Ray  (auto GPU / CPU)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
-    import ray, optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
+    """
+    Full grid search con itertools.product.
+    Checkpoint: ogni risultato viene appendito a ckpt_path (CSV) subito dopo
+    che arriva, così un crash/disconnect non perde nulla.
+    Resume: le combinazioni già presenti nel CSV vengono saltate.
+    """
+    import ray, itertools
 
     # ── Ray ─────────────────────────────────────────────────────────────
     print(f"  Connessione a Ray: {RAY_ADDRESS} ...", flush=True)
@@ -265,27 +270,29 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
     print("  Ray connesso.", flush=True)
 
     # Aspetta che tutti i worker GPU siano disponibili (max 2 min)
-    EXPECTED_GPUS = 3
+    EXPECTED_GPUS        = 3
     EXPECTED_WORKER_CPUS = 24   # 3 worker × 8 CPU ciascuno
-    WAIT_SECS = 120
+    WAIT_SECS            = 120
     _t_wait = time.time()
     while True:
         _res  = ray.cluster_resources()
         _gpus = int(_res.get("GPU", 0))
-        _cpus = int(_res.get("CPU", 1)) - 1   # escludi head node (1 CPU)
+        _cpus = int(_res.get("CPU", 1)) - 1   # escludi head node
         if _gpus >= EXPECTED_GPUS and _cpus >= EXPECTED_WORKER_CPUS:
             print(f"  ✓ Cluster pronto: {_gpus} GPU, {_cpus} CPU worker", flush=True)
             break
         elapsed_w = time.time() - _t_wait
         if elapsed_w >= WAIT_SECS:
-            print(f"  ⚠ Timeout ({WAIT_SECS}s): cluster ha solo {_gpus}/{EXPECTED_GPUS} GPU"
-                  f" e {_cpus}/{EXPECTED_WORKER_CPUS} CPU — procedo comunque.", flush=True)
+            print(f"  ⚠ Timeout ({WAIT_SECS}s): cluster ha solo "
+                  f"{_gpus}/{EXPECTED_GPUS} GPU, {_cpus}/{EXPECTED_WORKER_CPUS} CPU"
+                  f" — procedo comunque.", flush=True)
             break
-        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU, {_cpus}/{EXPECTED_WORKER_CPUS} CPU"
+        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU, "
+              f"{_cpus}/{EXPECTED_WORKER_CPUS} CPU"
               f" — attendo... ({int(WAIT_SECS - elapsed_w)}s rimasti)", flush=True)
         time.sleep(5)
 
-    MAX_TASK_SECS = 480   # 8 min — task oltre questo limite vengono cancellati
+    MAX_TASK_SECS = 480
 
     n_cpu = int(ray.cluster_resources().get("CPU", 1))
     n_gpu = int(ray.cluster_resources().get("GPU", 0))
@@ -302,64 +309,59 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
               f"({CPUS_PER_TASK} CPU/task)")
         print(f"  Backend       : umap-learn + sklearn HDBSCAN (silhouette)")
 
-    # ── Optuna study (checkpoint SQLite) ────────────────────────────────
-    db_path    = Path(C.RESULTS_DIR) / "optuna_study.db"
-    study_name = "step03_umap_hdbscan"
-    study = optuna.create_study(
-        study_name     = study_name,
-        storage        = f"sqlite:///{db_path}",
-        direction      = "maximize",
-        sampler        = optuna.samplers.GridSampler(SEARCH_SPACE),
-        load_if_exists = True,
-    )
+    # ── Resume: carica combinazioni già fatte dal checkpoint CSV ────────
+    done_keys = set()   # set di (nn, md, mcs) già completati
+    results   = []
+    if ckpt_path.exists():
+        ckpt_df = pd.read_csv(ckpt_path)
+        for _, row in ckpt_df.iterrows():
+            results.append(row.to_dict())
+            done_keys.add((row["n_neighbors"], row["min_dist"], row["min_cluster_size"]))
 
-    # Recupera trial già completati (resume)
-    results = [
-        {
-            "n_neighbors"      : t.params["n_neighbors"],
-            "min_dist"         : t.params["min_dist"],
-            "min_cluster_size" : t.params["min_cluster_size"],
-            "n_clusters"       : t.user_attrs.get("n_clusters", 0),
-            "noise_frac"       : t.user_attrs.get("noise_frac",  1.0),
-            "dbcv"             : t.value,
-            "backend"          : t.user_attrs.get("backend", "?"),
-            "metric"           : t.user_attrs.get("metric",  "?"),
-        }
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE
-    ]
-    n_done = len(results)
-    n_left = N_TRIALS - n_done
+    # ── Tutte le combinazioni del grid ───────────────────────────────────
+    all_combos = list(itertools.product(
+        SEARCH_SPACE["n_neighbors"],
+        SEARCH_SPACE["min_dist"],
+        SEARCH_SPACE["min_cluster_size"],
+    ))
+    todo = [(nn, md, mcs) for nn, md, mcs in all_combos
+            if (nn, md, mcs) not in done_keys]
+
+    n_done = len(done_keys)
+    n_left = len(todo)
 
     print(f"  Full grid: {N_TRIALS} trial  "
           f"({'da zero' if n_done == 0 else f'{n_done} già fatti → {n_left} rimasti'})")
 
-    if n_left <= 0:
-        print("  ✓ Tutti i trial già completati — carico dal DB.")
+    if n_left == 0:
+        print("  ✓ Tutti i trial già completati — carico dal checkpoint.")
         return _to_df(results)
 
-    # ── Loop ask-and-tell parallelo ──────────────────────────────────────
+    # ── Header CSV: scrivi solo se file nuovo ────────────────────────────
+    CSV_COLS = ["n_neighbors", "min_dist", "min_cluster_size",
+                "n_clusters", "noise_frac", "dbcv", "backend", "metric"]
+    write_header = not ckpt_path.exists()
+
+    # ── Loop parallelo ───────────────────────────────────────────────────
     E_ref     = ray.put(E_pca)
-    in_flight = {}
-    submitted = 0
+    in_flight = {}   # ref → (nn, md, mcs)
+    todo_iter = iter(todo)
     best_dbcv = max(
-        (r["dbcv"] for r in results if r["dbcv"] and not np.isnan(r["dbcv"])),
-        default=float("-inf")
+        (r["dbcv"] for r in results
+         if r.get("dbcv") is not None and not np.isnan(float(r["dbcv"]))),
+        default=float("-inf"),
     )
-    first_backend = None   # per rilevare se il primo trial è GPU o CPU
+    first_backend = None
 
-    def _dispatch():
-        trial = study.ask()
-        # suggest_categorical: TPE rispetta i valori discreti del search space
-        nn  = trial.suggest_categorical("n_neighbors",      SEARCH_SPACE["n_neighbors"])
-        md  = trial.suggest_categorical("min_dist",         SEARCH_SPACE["min_dist"])
-        mcs = trial.suggest_categorical("min_cluster_size", SEARCH_SPACE["min_cluster_size"])
-        return ray_run_one.remote(E_ref, nn, md, mcs), trial
+    def _dispatch_next():
+        nn, md, mcs = next(todo_iter)
+        ref = ray_run_one.remote(E_ref, nn, md, mcs)
+        return ref, (nn, md, mcs)
 
+    # Riempi il pool iniziale
     for _ in range(min(N_CONCURRENT, n_left)):
-        ref, trial = _dispatch()
-        in_flight[ref] = trial
-        submitted += 1
+        ref, combo = _dispatch_next()
+        in_flight[ref] = combo
 
     print(f"\n  {'#':>4}  {'nn':>4} {'md':>5} {'mcs':>5}  "
           f"{'score':>7}  {'k':>3}  {'noise':>6}  {'bk':>3}  note")
@@ -367,6 +369,7 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
           f"{'─'*7}  {'─'*3}  {'─'*6}  {'─'*3}  {'─'*6}")
 
     bar_fmt = "  {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
+    submitted = len(in_flight)
 
     with tqdm(total=N_TRIALS, initial=n_done, desc="  trials",
               ncols=88, bar_format=bar_fmt) as pbar:
@@ -377,112 +380,85 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
             done_refs, _ = ray.wait(list(in_flight.keys()), num_returns=1,
                                     timeout=MAX_TASK_SECS)
 
-            # ── Timeout: nessun task completato entro MAX_TASK_SECS ──────
+            # ── Timeout ──────────────────────────────────────────────────
             if not done_refs:
-                hung_ref   = next(iter(in_flight))
-                hung_trial = in_flight.pop(hung_ref)
-                tqdm.write(
-                    f"  ⏱  timeout ({MAX_TASK_SECS}s) — "
-                    f"trial {n_done+1} cancellato  "
-                    f"(nn={hung_trial.params.get('n_neighbors','?')} "
-                    f"md={hung_trial.params.get('min_dist','?')} "
-                    f"mcs={hung_trial.params.get('min_cluster_size','?')})"
-                )
-                try:
-                    ray.cancel(hung_ref, force=True)
-                except Exception:
-                    pass
-                try:
-                    study.tell(hung_trial, values=None,
-                               state=optuna.trial.TrialState.FAIL)
-                except (RuntimeError, ValueError):
-                    pass
+                hung_ref          = next(iter(in_flight))
+                nn, md, mcs       = in_flight.pop(hung_ref)
+                tqdm.write(f"  ⏱  timeout ({MAX_TASK_SECS}s) — "
+                           f"trial cancellato (nn={nn} md={md} mcs={mcs})")
+                try: ray.cancel(hung_ref, force=True)
+                except Exception: pass
                 n_done += 1
                 pbar.update(1)
                 if submitted < n_left:
                     try:
-                        ref, trial = _dispatch()
-                        in_flight[ref] = trial
+                        ref, combo = _dispatch_next()
+                        in_flight[ref] = combo
                         submitted += 1
-                    except Exception:
-                        pass
+                    except StopIteration: pass
                 continue
 
-            ref   = done_refs[0]
-            trial = in_flight.pop(ref)
+            ref        = done_refs[0]
+            nn, md, mcs = in_flight.pop(ref)
 
             try:
-                r   = ray.get(ref)
-                val = r["dbcv"] if (r["dbcv"] and not np.isnan(r["dbcv"])) \
-                                else float("-inf")
-
-                # Salva attributi nel DB Optuna
-                trial.set_user_attr("n_clusters", int(r["n_clusters"]))
-                trial.set_user_attr("noise_frac", float(r["noise_frac"]))
-                trial.set_user_attr("backend",    r.get("backend", "?"))
-                trial.set_user_attr("metric",     r.get("metric",  "?"))
-                if r.get("gpu_err"):
-                    trial.set_user_attr("gpu_err", r["gpu_err"])
-
-                try:
-                    study.tell(trial, val)
-                except (RuntimeError, ValueError):
-                    pass   # GridSampler chiama study.stop() all'ultimo trial
-
-                results.append(r)
-
-                is_best = np.isfinite(val) and val > best_dbcv
-                if is_best:
-                    best_dbcv = val
-
-                # Backend tag corto
-                bk = r.get("backend", "?")
-                bk_short = "GPU" if bk == "GPU" else "CPU"
-
-                # Avviso se primo trial GPU fallisce
-                if first_backend is None:
-                    first_backend = bk_short
-                    if bk_short == "CPU" and n_gpu > 0:
-                        gpu_err = r.get("gpu_err", "unknown")
-                        tqdm.write(f"\n  ⚠  GPU non disponibile su questo nodo: {gpu_err}")
-                        tqdm.write(f"  ⚠  Esecuzione in modalità CPU fallback.\n")
-
-                sc_str = (f"{r['dbcv']:.4f}"
-                          if (r["dbcv"] and not np.isnan(r["dbcv"])) else "   nan")
-                tqdm.write(
-                    f"  {n_done+1:>4}  "
-                    f"{int(r['n_neighbors']):>4} "
-                    f"{float(r['min_dist']):>5.2f} "
-                    f"{int(r['min_cluster_size']):>5}  "
-                    f"{sc_str:>7}  "
-                    f"{int(r['n_clusters']):>3}  "
-                    f"{r['noise_frac']:>6.1%}  "
-                    f"{bk_short:>3}"
-                    f"{'  ← best!' if is_best else ''}"
-                )
-                pbar.set_postfix(
-                    best=f"{best_dbcv:.4f}" if np.isfinite(best_dbcv) else "n/a",
-                    refresh=False,
-                )
-
+                r = ray.get(ref)
             except Exception as e:
-                try:
-                    study.tell(trial, values=None,
-                               state=optuna.trial.TrialState.FAIL)
-                except (RuntimeError, ValueError):
-                    pass
-                tqdm.write(f"  ⚠  trial {n_done+1} fallito: {e}")
+                tqdm.write(f"  ⚠  trial fallito (nn={nn} md={md} mcs={mcs}): {e}")
+                n_done += 1
+                pbar.update(1)
+                if submitted < n_left:
+                    try:
+                        ref, combo = _dispatch_next()
+                        in_flight[ref] = combo
+                        submitted += 1
+                    except StopIteration: pass
+                continue
 
+            # ── Checkpoint immediato (append CSV) ────────────────────────
+            row_df = pd.DataFrame([{k: r.get(k) for k in CSV_COLS}])
+            row_df.to_csv(ckpt_path, mode="a", header=write_header, index=False)
+            write_header = False
+            results.append(r)
+
+            val       = float(r["dbcv"]) if (r.get("dbcv") is not None
+                                              and not np.isnan(float(r["dbcv"]))) \
+                        else float("-inf")
+            is_best   = np.isfinite(val) and val > best_dbcv
+            if is_best:
+                best_dbcv = val
+
+            bk_short = "GPU" if r.get("backend") == "GPU" else "CPU"
+            if first_backend is None:
+                first_backend = bk_short
+                if bk_short == "CPU" and n_gpu > 0:
+                    tqdm.write(f"\n  ⚠  GPU non disponibile — fallback CPU\n")
+
+            sc_str = (f"{float(r['dbcv']):.4f}"
+                      if (r.get("dbcv") is not None and not np.isnan(float(r["dbcv"])))
+                      else "   nan")
+            tqdm.write(
+                f"  {n_done+1:>4}  "
+                f"{int(r['n_neighbors']):>4} "
+                f"{float(r['min_dist']):>5.2f} "
+                f"{int(r['min_cluster_size']):>5}  "
+                f"{sc_str:>7}  "
+                f"{int(r['n_clusters']):>3}  "
+                f"{r['noise_frac']:>6.1%}  "
+                f"{bk_short:>3}"
+                f"{'  ← best!' if is_best else ''}"
+            )
+            pbar.set_postfix(best=f"{best_dbcv:.4f}" if np.isfinite(best_dbcv) else "n/a",
+                             refresh=False)
             n_done += 1
             pbar.update(1)
 
             if submitted < n_left:
                 try:
-                    ref, trial = _dispatch()
-                    in_flight[ref] = trial
+                    ref, combo = _dispatch_next()
+                    in_flight[ref] = combo
                     submitted += 1
-                except Exception:
-                    pass   # grid esaurita
+                except StopIteration: pass
 
     if not results:
         raise RuntimeError("Zero risultati — tutti i Ray task sono falliti.")
@@ -723,14 +699,14 @@ def main():
     t0 = time.time()
 
     grid_path   = Path(C.RESULTS_DIR) / "grid_results.csv"
+    ckpt_path   = Path(C.RESULTS_DIR) / "grid_checkpoint.csv"
     best_path   = Path(C.RESULTS_DIR) / "best_params.json"
     umap_path   = Path(C.RESULTS_DIR) / "umap.parquet"
     regime_path = Path(C.RESULTS_DIR) / "regimes.parquet"
 
     # ── Fresh start ──────────────────────────────────────────────────────
     if FRESH_START:
-        for p in [grid_path, best_path, umap_path, regime_path,
-                  Path(C.RESULTS_DIR) / "optuna_study.db"]:
+        for p in [grid_path, ckpt_path, best_path, umap_path, regime_path]:
             if p.exists():
                 p.unlink()
                 print(f"  [fresh] rimosso {p.name}")
@@ -760,24 +736,27 @@ def main():
     E   = pca.fit_transform(E_raw).astype(np.float32)
     print(f"  → {E.shape[1]}D  ({pca.explained_variance_ratio_.sum():.1%} varianza spiegata)")
 
-    # ── 2. Grid search (con resume automatico) ───────────────────────────
+    # ── 2. Grid search (con resume automatico via checkpoint CSV) ────────
     if grid_path.exists():
         print(f"\n[2/5] Grid results già presenti — carico da {grid_path}")
         grid_df = pd.read_csv(grid_path)
         print(f"  {len(grid_df)} trial  |  "
               f"{grid_df['dbcv'].notna().sum()} validi")
     else:
+        n_already = len(pd.read_csv(ckpt_path)) if ckpt_path.exists() else 0
         print(f"\n[2/5] Grid search  ({E.shape[1]}D → {UMAP_N_COMPONENTS}D → HDBSCAN)...")
+        if n_already:
+            print(f"  Resume: {n_already} trial già nel checkpoint — continuo da lì.")
         MAX_CONN_RETRIES = 10
         for _attempt in range(MAX_CONN_RETRIES):
             try:
-                grid_df = grid_search(E)
+                grid_df = grid_search(E, ckpt_path)
                 break
             except ConnectionError as _e:
                 if _attempt < MAX_CONN_RETRIES - 1:
                     _wait = 30 * (_attempt + 1)
                     print(f"\n  ⚠  Connessione Ray persa: {_e}")
-                    print(f"  ↺  I trial completati sono nel DB.")
+                    print(f"  ↺  Trial salvati nel checkpoint CSV.")
                     print(f"  ↺  Riconnessione tra {_wait}s "
                           f"(tentativo {_attempt+2}/{MAX_CONN_RETRIES})...")
                     try:
@@ -787,6 +766,7 @@ def main():
                     time.sleep(_wait)
                 else:
                     raise
+        # Salva CSV finale ordinato per dbcv
         grid_df.to_csv(grid_path, index=False)
         print(f"\n  Salvato → {grid_path}")
 
