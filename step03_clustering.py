@@ -75,7 +75,7 @@ SEARCH_SPACE = {
     "min_cluster_size" : [30, 50, 75, 100, 150, 200, 300, 500],
 }
 N_TRIALS      = math.prod(len(v) for v in SEARCH_SPACE.values())   # 320 full grid
-MAX_NOISE_FRAC = 0.15   # trial con noise > 15% → score=nan, esclusi dal ranking
+MAX_NOISE_FRAC = 0.05   # trial con noise > 5% → score=nan, esclusi dal ranking
 
 
 
