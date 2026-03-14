@@ -61,7 +61,7 @@ PLOT_DIR          = Path(C.RESULTS_DIR) / "step03"
 # ── Modalità sviluppo ────────────────────────────────────────────────────
 # True  → cancella tutti i checkpoint ad ogni run (sempre da zero)
 # False → riprende da dove era rimasto (comportamento produzione)
-FRESH_START = False
+FRESH_START = True
 
 # Path dove pip installa i pacchetti di sistema sui nodi
 CUML_BASE = "/usr/local/lib/python3.12/dist-packages"
@@ -71,7 +71,8 @@ SEARCH_SPACE = {
     "min_dist"         : [0.0, 0.05, 0.1, 0.2, 0.3],
     "min_cluster_size" : [30, 50, 75, 100, 150, 200, 300, 500],
 }
-N_TRIALS = math.prod(len(v) for v in SEARCH_SPACE.values())   # 320 full grid
+N_TRIALS      = math.prod(len(v) for v in SEARCH_SPACE.values())   # 320 full grid
+MAX_NOISE_FRAC = 0.30   # trial con noise > 30% → score=nan, esclusi dal ranking
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -182,12 +183,14 @@ def run_one(E_pca: np.ndarray, n_neighbors: int, min_dist: float,
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         noise_frac = float((labels == -1).mean())
 
-        # DBCV reale tramite relative_validity_ (cuML HDBSCAN lo supporta)
-        if n_clusters >= 2 and hasattr(hdb, "relative_validity_"):
+        # Vincolo noise: se troppo rumore il trial è invalido
+        if noise_frac > MAX_NOISE_FRAC:
+            score       = float("nan")
+            metric_used = "noise_exceed"
+        elif n_clusters >= 2 and hasattr(hdb, "relative_validity_"):
             score       = float(hdb.relative_validity_)
             metric_used = "dbcv"
         elif n_clusters >= 2:
-            # fallback silhouette se relative_validity_ non disponibile
             from sklearn.metrics import silhouette_score
             mask = labels != -1
             score = (float(silhouette_score(Z[mask], labels[mask]))
@@ -237,7 +240,9 @@ def run_one(E_pca: np.ndarray, n_neighbors: int, min_dist: float,
     noise_frac = float((labels == -1).mean())
     mask       = labels != -1
 
-    if n_clusters >= 2 and mask.sum() > n_clusters:
+    if noise_frac > MAX_NOISE_FRAC:
+        score = float("nan")
+    elif n_clusters >= 2 and mask.sum() > n_clusters:
         score = float(silhouette_score(Z[mask], labels[mask], metric="euclidean"))
     else:
         score = float("nan")
