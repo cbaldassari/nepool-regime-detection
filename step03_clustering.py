@@ -61,7 +61,7 @@ PLOT_DIR          = Path(C.RESULTS_DIR) / "step03"
 # ── Modalità sviluppo ────────────────────────────────────────────────────
 # True  → cancella tutti i checkpoint ad ogni run (sempre da zero)
 # False → riprende da dove era rimasto (comportamento produzione)
-FRESH_START = True
+FRESH_START = False
 
 # Path dove pip installa i pacchetti di sistema sui nodi
 CUML_BASE = "/usr/local/lib/python3.12/dist-packages"
@@ -697,7 +697,26 @@ def main():
               f"{grid_df['dbcv'].notna().sum()} validi")
     else:
         print(f"\n[3/6] Grid search...")
-        grid_df = grid_search(E_pca)
+        # Retry automatico se la connessione Ray Client cade
+        MAX_CONN_RETRIES = 10
+        for _attempt in range(MAX_CONN_RETRIES):
+            try:
+                grid_df = grid_search(E_pca)
+                break
+            except ConnectionError as _e:
+                if _attempt < MAX_CONN_RETRIES - 1:
+                    _wait = 30 * (_attempt + 1)
+                    print(f"\n  ⚠  Connessione Ray persa: {_e}")
+                    print(f"  ↺  I trial completati sono nel DB.")
+                    print(f"  ↺  Riconnessione tra {_wait}s "
+                          f"(tentativo {_attempt+2}/{MAX_CONN_RETRIES})...")
+                    try:
+                        import ray; ray.shutdown()
+                    except Exception:
+                        pass
+                    time.sleep(_wait)
+                else:
+                    raise
         grid_df.to_csv(grid_path, index=False)
         print(f"\n  Salvato → {grid_path}")
 
