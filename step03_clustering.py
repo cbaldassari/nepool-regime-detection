@@ -53,6 +53,7 @@ import config as C
 #  Configurazione
 # ═══════════════════════════════════════════════════════════════════════════
 
+PCA_COMPONENTS        = 100  # pre-riduzione CPU (evita GPU OOM su 8448D)
 UMAP_N_COMPONENTS     = 20   # dimensioni per clustering HDBSCAN
 UMAP_VIZ_COMPONENTS   = 2    # dimensioni per visualizzazione 2D
 RANDOM_STATE          = 42
@@ -494,7 +495,7 @@ def final_run(E: np.ndarray, best: dict, use_gpu: bool):
           f"mcs={int(best['min_cluster_size'])}  "
           f"score={float(best['dbcv']):.4f}")
     print(f"  Backend: {'GPU (cuML)' if use_gpu else 'CPU (umap-learn)'}")
-    print(f"  Step 1: UMAP {E.shape[1]}D → {UMAP_N_COMPONENTS}D → HDBSCAN")
+    print(f"  Step 1: UMAP {PCA_COMPONENTS}D → {UMAP_N_COMPONENTS}D → HDBSCAN")
     print(f"  Step 2: UMAP {UMAP_N_COMPONENTS}D → {UMAP_VIZ_COMPONENTS}D (visualizzazione)")
 
     if use_gpu:
@@ -718,17 +719,25 @@ def main():
     print("═" * 65)
     print(f"  Ray     : {RAY_ADDRESS}")
     print(f"  Space   : {N_TRIALS} trials  full grid  (8×5×8)")
-    print(f"  UMAP    : {UMAP_N_COMPONENTS}D clustering  +  {UMAP_VIZ_COMPONENTS}D viz")
+    print(f"  Pipeline: 8448D →[PCA]→ {PCA_COMPONENTS}D →[UMAP]→ {UMAP_N_COMPONENTS}D →[HDBSCAN]")
+    print(f"  Viz     : {UMAP_N_COMPONENTS}D →[UMAP]→ {UMAP_VIZ_COMPONENTS}D")
     print(f"  Noise   : max {MAX_NOISE_FRAC:.0%}")
     print("─" * 65)
 
-    # ── 1. Embeddings ────────────────────────────────────────────────────
-    print("\n[1/5] Loading embeddings...")
+    # ── 1. Embeddings + PCA pre-riduzione ───────────────────────────────
+    print("\n[1/5] Loading embeddings + PCA pre-riduzione...")
     emb_df     = pd.read_parquet(Path(C.RESULTS_DIR) / "embeddings.parquet")
     timestamps = pd.to_datetime(emb_df["datetime"])
-    E          = emb_df[[c for c in emb_df.columns
+    E_raw      = emb_df[[c for c in emb_df.columns
                           if c.startswith("emb_")]].values.astype(np.float32)
-    print(f"  {len(E):,} windows × {E.shape[1]:,} dims")
+    print(f"  {len(E_raw):,} windows × {E_raw.shape[1]:,} dims")
+
+    # PCA CPU: riduce 8448D → PCA_COMPONENTS per evitare GPU OOM in cuML UMAP
+    print(f"  PCA {E_raw.shape[1]}D → {PCA_COMPONENTS}D  (CPU, sklearn)...", flush=True)
+    from sklearn.decomposition import PCA
+    E = PCA(n_components=PCA_COMPONENTS, random_state=RANDOM_STATE
+            ).fit_transform(E_raw).astype(np.float32)
+    print(f"  → {E.shape[1]}D  (varianza spiegata inclusa nei {PCA_COMPONENTS} componenti)")
 
     # ── 2. Grid search (con resume automatico) ───────────────────────────
     if grid_path.exists():
@@ -737,7 +746,7 @@ def main():
         print(f"  {len(grid_df)} trial  |  "
               f"{grid_df['dbcv'].notna().sum()} validi")
     else:
-        print(f"\n[2/5] Grid search  ({E.shape[1]}D → {UMAP_N_COMPONENTS}D → HDBSCAN)...")
+        print(f"\n[2/5] Grid search  ({PCA_COMPONENTS}D → {UMAP_N_COMPONENTS}D → HDBSCAN)...")
         MAX_CONN_RETRIES = 10
         for _attempt in range(MAX_CONN_RETRIES):
             try:
