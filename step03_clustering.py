@@ -264,6 +264,27 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True, log_to_driver=False)
     print("  Ray connesso.", flush=True)
 
+    # Aspetta che tutti i worker GPU siano disponibili (max 2 min)
+    EXPECTED_GPUS = 3
+    EXPECTED_WORKER_CPUS = 24   # 3 worker × 8 CPU ciascuno
+    WAIT_SECS = 120
+    _t_wait = time.time()
+    while True:
+        _res  = ray.cluster_resources()
+        _gpus = int(_res.get("GPU", 0))
+        _cpus = int(_res.get("CPU", 1)) - 1   # escludi head node (1 CPU)
+        if _gpus >= EXPECTED_GPUS and _cpus >= EXPECTED_WORKER_CPUS:
+            print(f"  ✓ Cluster pronto: {_gpus} GPU, {_cpus} CPU worker", flush=True)
+            break
+        elapsed_w = time.time() - _t_wait
+        if elapsed_w >= WAIT_SECS:
+            print(f"  ⚠ Timeout ({WAIT_SECS}s): cluster ha solo {_gpus}/{EXPECTED_GPUS} GPU"
+                  f" e {_cpus}/{EXPECTED_WORKER_CPUS} CPU — procedo comunque.", flush=True)
+            break
+        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU, {_cpus}/{EXPECTED_WORKER_CPUS} CPU"
+              f" — attendo... ({int(WAIT_SECS - elapsed_w)}s rimasti)", flush=True)
+        time.sleep(5)
+
     MAX_TASK_SECS = 480   # 8 min — task oltre questo limite vengono cancellati
 
     n_cpu = int(ray.cluster_resources().get("CPU", 1))
