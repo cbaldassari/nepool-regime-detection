@@ -53,7 +53,7 @@ import config as C
 #  Configurazione
 # ═══════════════════════════════════════════════════════════════════════════
 
-PCA_VARIANCE          = 0.95 # pre-riduzione CPU: componenti che spiegano 95% varianza
+PCA_VARIANCE          = 0.90 # pre-riduzione CPU: componenti che spiegano 90% varianza
 UMAP_N_COMPONENTS     = 20   # dimensioni per clustering HDBSCAN
 UMAP_VIZ_COMPONENTS   = 2    # dimensioni per visualizzazione 2D
 RANDOM_STATE          = 42
@@ -364,97 +364,105 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
     print(f"  {'─'*4}  {'─'*4} {'─'*5} {'─'*5}  "
           f"{'─'*7}  {'─'*3}  {'─'*6}  {'─'*3}  {'─'*6}")
 
-    bar_fmt = "  {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
-    submitted = len(in_flight)
+    submitted  = len(in_flight)
+    t_start    = time.time()
 
-    with tqdm(total=N_TRIALS, initial=n_done, desc="  trials",
-              ncols=88, bar_format=bar_fmt, file=sys.stdout) as pbar:
-        pbar.set_postfix(best=f"{best_dbcv:.4f}" if np.isfinite(best_dbcv) else "n/a",
-                         refresh=False)
+    while in_flight:
+        done_refs, _ = ray.wait(list(in_flight.keys()), num_returns=1,
+                                timeout=MAX_TASK_SECS)
 
-        while in_flight:
-            done_refs, _ = ray.wait(list(in_flight.keys()), num_returns=1,
-                                    timeout=MAX_TASK_SECS)
-
-            # ── Timeout ──────────────────────────────────────────────────
-            if not done_refs:
-                hung_ref          = next(iter(in_flight))
-                nn, md, mcs       = in_flight.pop(hung_ref)
-                tqdm.write(f"  ⏱  timeout ({MAX_TASK_SECS}s) — "
-                           f"trial cancellato (nn={nn} md={md} mcs={mcs})")
-                try: ray.cancel(hung_ref, force=True)
-                except Exception: pass
-                n_done += 1
-                pbar.update(1)
-                if submitted < n_left:
-                    try:
-                        ref, combo = _dispatch_next()
-                        in_flight[ref] = combo
-                        submitted += 1
-                    except StopIteration: pass
-                continue
-
-            ref        = done_refs[0]
-            nn, md, mcs = in_flight.pop(ref)
-
-            try:
-                r = ray.get(ref)
-            except Exception as e:
-                tqdm.write(f"  ⚠  trial fallito (nn={nn} md={md} mcs={mcs}): {e}")
-                n_done += 1
-                pbar.update(1)
-                if submitted < n_left:
-                    try:
-                        ref, combo = _dispatch_next()
-                        in_flight[ref] = combo
-                        submitted += 1
-                    except StopIteration: pass
-                continue
-
-            # ── Checkpoint immediato (append CSV) ────────────────────────
-            row_df = pd.DataFrame([{k: r.get(k) for k in CSV_COLS}])
-            row_df.to_csv(ckpt_path, mode="a", header=write_header, index=False)
-            write_header = False
-            results.append(r)
-
-            val       = float(r["dbcv"]) if (r.get("dbcv") is not None
-                                              and not np.isnan(float(r["dbcv"]))) \
-                        else float("-inf")
-            is_best   = np.isfinite(val) and val > best_dbcv
-            if is_best:
-                best_dbcv = val
-
-            bk_short = "GPU" if r.get("backend") == "GPU" else "CPU"
-            if first_backend is None:
-                first_backend = bk_short
-                if bk_short == "CPU" and n_gpu > 0:
-                    tqdm.write(f"\n  ⚠  GPU non disponibile — fallback CPU\n")
-
-            sc_str = (f"{float(r['dbcv']):.4f}"
-                      if (r.get("dbcv") is not None and not np.isnan(float(r["dbcv"])))
-                      else "   nan")
-            tqdm.write(
-                f"  {n_done+1:>4}  "
-                f"{int(r['n_neighbors']):>4} "
-                f"{float(r['min_dist']):>5.2f} "
-                f"{int(r['min_cluster_size']):>5}  "
-                f"{sc_str:>7}  "
-                f"{int(r['n_clusters']):>3}  "
-                f"{r['noise_frac']:>6.1%}  "
-                f"{bk_short:>3}"
-                f"{'  ← best!' if is_best else ''}"
-            )
-            pbar.set_postfix(best=f"{best_dbcv:.4f}" if np.isfinite(best_dbcv) else "n/a",
-                             refresh=False)
+        # ── Timeout ──────────────────────────────────────────────────────
+        if not done_refs:
+            hung_ref    = next(iter(in_flight))
+            nn, md, mcs = in_flight.pop(hung_ref)
+            print(f"  ⏱  timeout ({MAX_TASK_SECS}s) — "
+                  f"trial cancellato (nn={nn} md={md} mcs={mcs})", flush=True)
+            try: ray.cancel(hung_ref, force=True)
+            except Exception: pass
             n_done += 1
-            pbar.update(1)
-
             if submitted < n_left:
                 try:
                     ref, combo = _dispatch_next()
                     in_flight[ref] = combo
                     submitted += 1
                 except StopIteration: pass
+            continue
+
+        ref         = done_refs[0]
+        nn, md, mcs = in_flight.pop(ref)
+
+        try:
+            r = ray.get(ref)
+        except Exception as e:
+            print(f"  ⚠  trial fallito (nn={nn} md={md} mcs={mcs}): {e}", flush=True)
+            n_done += 1
+            if submitted < n_left:
+                try:
+                    ref, combo = _dispatch_next()
+                    in_flight[ref] = combo
+                    submitted += 1
+                except StopIteration: pass
+            continue
+
+        # ── Checkpoint immediato (append CSV) ────────────────────────────
+        row_df = pd.DataFrame([{k: r.get(k) for k in CSV_COLS}])
+        row_df.to_csv(ckpt_path, mode="a", header=write_header, index=False)
+        write_header = False
+        results.append(r)
+
+        val     = float(r["dbcv"]) if (r.get("dbcv") is not None
+                                        and not np.isnan(float(r["dbcv"]))) \
+                  else float("-inf")
+        is_best = np.isfinite(val) and val > best_dbcv
+        if is_best:
+            best_dbcv = val
+
+        bk_short = "GPU" if r.get("backend") == "GPU" else "CPU"
+        if first_backend is None:
+            first_backend = bk_short
+            if bk_short == "CPU" and n_gpu > 0:
+                print(f"\n  ⚠  GPU non disponibile — fallback CPU\n", flush=True)
+
+        sc_str = (f"{float(r['dbcv']):.4f}"
+                  if (r.get("dbcv") is not None and not np.isnan(float(r["dbcv"])))
+                  else "   nan")
+
+        # Stima tempo rimanente
+        elapsed_s  = time.time() - t_start
+        rate       = (n_done + 1) / elapsed_s if elapsed_s > 0 else 0
+        remaining  = (N_TRIALS - n_done - 1) / rate if rate > 0 else 0
+        eta_str    = f"{int(remaining//60)}m{int(remaining%60):02d}s" if rate > 0 else "?"
+
+        print(
+            f"  {n_done+1:>4}/{N_TRIALS}  "
+            f"nn={int(r['n_neighbors']):>3} md={float(r['min_dist']):.2f} "
+            f"mcs={int(r['min_cluster_size']):>3}  "
+            f"score={sc_str}  k={int(r['n_clusters']):>2}  "
+            f"noise={r['noise_frac']:>5.1%}  {bk_short}"
+            f"  best={best_dbcv:.4f}" if np.isfinite(best_dbcv) else
+            f"  {n_done+1:>4}/{N_TRIALS}  "
+            f"nn={int(r['n_neighbors']):>3} md={float(r['min_dist']):.2f} "
+            f"mcs={int(r['min_cluster_size']):>3}  "
+            f"score={sc_str}  k={int(r['n_clusters']):>2}  "
+            f"noise={r['noise_frac']:>5.1%}  {bk_short}"
+            f"  best=n/a",
+            flush=True
+        )
+        if is_best:
+            print(f"  {'':>4}  ↑ nuovo best!", flush=True)
+
+        # Stampa progresso ogni 10 trial
+        if (n_done + 1) % 10 == 0:
+            print(f"  ── {n_done+1}/{N_TRIALS} trial completati  "
+                  f"ETA {eta_str} ──", flush=True)
+
+        n_done += 1
+        if submitted < n_left:
+            try:
+                ref, combo = _dispatch_next()
+                in_flight[ref] = combo
+                submitted += 1
+            except StopIteration: pass
 
     if not results:
         raise RuntimeError("Zero risultati — tutti i Ray task sono falliti.")
@@ -712,7 +720,7 @@ def main():
     print("═" * 65)
     print(f"  Ray     : {RAY_ADDRESS}")
     print(f"  Space   : {N_TRIALS} trials  full grid  (8×5×8)")
-    print(f"  Pipeline: 8448D →[PCA {PCA_VARIANCE:.0%}var]→ ?D →[UMAP]→ {UMAP_N_COMPONENTS}D →[HDBSCAN]")
+    print(f"  Pipeline: 8448D →[PCA {PCA_VARIANCE:.0%}]→ ?D →[UMAP]→ {UMAP_N_COMPONENTS}D →[HDBSCAN]")
     print(f"  Viz     : {UMAP_N_COMPONENTS}D →[UMAP]→ {UMAP_VIZ_COMPONENTS}D")
     print(f"  Noise   : max {MAX_NOISE_FRAC:.0%}")
     print("─" * 65)
@@ -725,13 +733,13 @@ def main():
                           if c.startswith("emb_")]].values.astype(np.float32)
     print(f"  {len(E_raw):,} windows × {E_raw.shape[1]:,} dims")
 
-    # StandardScaler + PCA CPU: riduce 8448D → n componenti che spiegano PCA_VARIANCE
-    print(f"  StandardScaler + PCA {E_raw.shape[1]}D → {PCA_VARIANCE:.0%} varianza  (CPU)...", flush=True)
+    # PCA CPU: riduce 8448D → n componenti che spiegano PCA_VARIANCE
+    # Nota: NO StandardScaler — gli embedding Chronos-2 sono già rappresentazioni
+    # apprese; scalare distrugge la struttura semantica e gonfia le dimensioni.
+    print(f"  PCA {E_raw.shape[1]}D → {PCA_VARIANCE:.0%} varianza  (CPU)...", flush=True)
     from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    E_scaled = StandardScaler().fit_transform(E_raw)
     pca = PCA(n_components=PCA_VARIANCE, random_state=RANDOM_STATE)
-    E   = pca.fit_transform(E_scaled).astype(np.float32)
+    E   = pca.fit_transform(E_raw).astype(np.float32)
     print(f"  → {E.shape[1]}D  ({pca.explained_variance_ratio_.sum():.1%} varianza spiegata)")
 
     # ── 2. Grid search (con resume automatico via checkpoint CSV) ────────
