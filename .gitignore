@@ -1,0 +1,43 @@
+# Dati grandi — non vanno in git
+*.parquet
+*.csv
+*.db
+*.zip
+
+# Risultati computazionali
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Ambienti virtuali
+venv/
+.venv/
+env/
+
+# File di sistema
+.DS_Store
+Thumbs.db
+
+# Script di diagnostica/fix temporanei
+fix_cuml_path.py
+fix_nvjitlink.py
+fix_nvjitlink_worker02.py
+install_cuml_worker02.py
+install_umap.py
+install_rapids_ssh.sh
+check_cluster.py
+probe_workers.py
+remote_squaretest.py
+squaretest.py
+probe_env.py
+
+# Notebook e log
+*.log
+*.ipynb_checkpoints
+
+# Secrets
+.env
