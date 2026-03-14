@@ -75,7 +75,7 @@ SEARCH_SPACE = {
     "min_cluster_size" : [30, 50, 75, 100, 150, 200, 300, 500],
 }
 N_TRIALS      = math.prod(len(v) for v in SEARCH_SPACE.values())   # 320 full grid
-MAX_NOISE_FRAC = 0.05   # trial con noise > 5% → score=nan, esclusi dal ranking
+MAX_NOISE_FRAC = 0.15   # trial con noise > 15% → score=nan, esclusi dal ranking
 
 
 
@@ -269,24 +269,30 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True, log_to_driver=False)
     print("  Ray connesso.", flush=True)
 
-    # Aspetta che tutti i worker GPU siano disponibili (max 2 min)
+    # Aspetta GPU: parto subito se ci sono tutte, aspetto max 30s se ne manca qualcuna
     EXPECTED_GPUS = 3
-    WAIT_SECS     = 120
-    _t_wait = time.time()
-    while True:
-        _res  = ray.cluster_resources()
-        _gpus = int(_res.get("GPU", 0))
-        if _gpus >= EXPECTED_GPUS:
-            print(f"  ✓ Cluster pronto: {_gpus} GPU", flush=True)
-            break
-        elapsed_w = time.time() - _t_wait
-        if elapsed_w >= WAIT_SECS:
-            print(f"  ⚠ Timeout ({WAIT_SECS}s): cluster ha solo "
-                  f"{_gpus}/{EXPECTED_GPUS} GPU — procedo comunque.", flush=True)
-            break
-        print(f"  ⏳ Cluster: {_gpus}/{EXPECTED_GPUS} GPU"
-              f" — attendo... ({int(WAIT_SECS - elapsed_w)}s rimasti)", flush=True)
-        time.sleep(5)
+    _res  = ray.cluster_resources()
+    _gpus = int(_res.get("GPU", 0))
+    if _gpus >= EXPECTED_GPUS:
+        print(f"  ✓ Cluster pronto: {_gpus} GPU", flush=True)
+    elif _gpus == 0:
+        print(f"  ⚠ Nessuna GPU disponibile — attendo max 60s...", flush=True)
+        _t_wait = time.time()
+        while int(ray.cluster_resources().get("GPU", 0)) == 0:
+            if time.time() - _t_wait > 60:
+                break
+            time.sleep(5)
+        _gpus = int(ray.cluster_resources().get("GPU", 0))
+        print(f"  {'✓' if _gpus > 0 else '⚠'} GPU disponibili: {_gpus}", flush=True)
+    else:
+        print(f"  ⚠ Solo {_gpus}/{EXPECTED_GPUS} GPU — attendo max 30s...", flush=True)
+        _t_wait = time.time()
+        while int(ray.cluster_resources().get("GPU", 0)) < EXPECTED_GPUS:
+            if time.time() - _t_wait > 30:
+                break
+            time.sleep(5)
+        _gpus = int(ray.cluster_resources().get("GPU", 0))
+        print(f"  {'✓' if _gpus >= EXPECTED_GPUS else '⚠'} GPU disponibili: {_gpus}", flush=True)
 
     MAX_TASK_SECS = 480
 
