@@ -44,6 +44,8 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 import sys
+sys.stdout.reconfigure(line_buffering=True)   # flush immediato ad ogni print
+sys.stderr.reconfigure(line_buffering=True)
 sys.path.insert(0, str(Path(__file__).parent))
 import config as C
 
@@ -257,7 +259,9 @@ def grid_search(E_pca: np.ndarray) -> pd.DataFrame:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     # ── Ray ─────────────────────────────────────────────────────────────
+    print(f"  Connessione a Ray: {RAY_ADDRESS} ...", flush=True)
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True, log_to_driver=False)
+    print("  Ray connesso.", flush=True)
 
     MAX_TASK_SECS = 480   # 8 min — task oltre questo limite vengono cancellati
 
@@ -481,7 +485,9 @@ def final_run(E: np.ndarray, best: dict, use_gpu: bool):
       2. UMAP 20D  →  2D   (fisso)        → coordinate per visualizzazione
     """
     import ray
+    print(f"  Connessione a Ray: {RAY_ADDRESS} ...", flush=True)
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True, log_to_driver=False)
+    print("  Ray connesso.", flush=True)
 
     print(f"  Params: nn={int(best['n_neighbors'])}  "
           f"md={float(best['min_dist']):.2f}  "
@@ -771,6 +777,7 @@ def main():
 
     # ── 4. Final run ─────────────────────────────────────────────────────
     import ray
+    print("  Verifica risorse cluster...", flush=True)
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True)
     use_gpu = int(ray.cluster_resources().get("GPU", 0)) > 0
     ray.shutdown()
