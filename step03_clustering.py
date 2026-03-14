@@ -53,7 +53,7 @@ import config as C
 #  Configurazione
 # ═══════════════════════════════════════════════════════════════════════════
 
-PCA_VARIANCE          = 0.90 # pre-riduzione CPU: componenti che spiegano 90% varianza
+PCA_VARIANCE          = 0.95 # pre-riduzione CPU: componenti che spiegano 95% varianza
 UMAP_N_COMPONENTS     = 20   # dimensioni per clustering HDBSCAN
 UMAP_VIZ_COMPONENTS   = 2    # dimensioni per visualizzazione 2D
 RANDOM_STATE          = 42
