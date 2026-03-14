@@ -51,9 +51,9 @@ import config as C
 #  Configurazione
 # ═══════════════════════════════════════════════════════════════════════════
 
-PCA_COMPONENTS    = 100
-UMAP_N_COMPONENTS = 2
-RANDOM_STATE      = 42
+UMAP_N_COMPONENTS     = 20   # dimensioni per clustering HDBSCAN
+UMAP_VIZ_COMPONENTS   = 2    # dimensioni per visualizzazione 2D
+RANDOM_STATE          = 42
 RAY_ADDRESS       = "ray://datalab-rayclnt.unitus.it:10001"
 CPUS_PER_TASK     = 2          # usato solo in modalità CPU
 PLOT_DIR          = Path(C.RESULTS_DIR) / "step03"
@@ -74,20 +74,6 @@ SEARCH_SPACE = {
 N_TRIALS      = math.prod(len(v) for v in SEARCH_SPACE.values())   # 320 full grid
 MAX_NOISE_FRAC = 0.05   # trial con noise > 5% → score=nan, esclusi dal ranking
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PCA
-# ═══════════════════════════════════════════════════════════════════════════
-
-def pca_reduce(E: np.ndarray, n_components):
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    scaler  = StandardScaler()
-    E_std   = scaler.fit_transform(E)
-    pca     = PCA(n_components=n_components, random_state=RANDOM_STATE)
-    E_pca   = pca.fit_transform(E_std)
-    cum_var = pca.explained_variance_ratio_.cumsum()[-1]
-    return E_pca, cum_var
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -160,13 +146,14 @@ def run_one(E_pca: np.ndarray, n_neighbors: int, min_dist: float,
 
         E_gpu = cp.asarray(E_pca.astype(np.float32))
 
+        # UMAP 8448D → 20D per clustering
         Z_gpu = cuUMAP(
-            n_components = UMAP_N_COMPONENTS,
+            n_components = UMAP_N_COMPONENTS,     # 20D
             n_neighbors  = n_neighbors,
             min_dist     = min_dist,
             metric       = "euclidean",
             random_state = RANDOM_STATE,
-            n_epochs     = 100,       # grid search: 100 epoch sufficienti
+            n_epochs     = 100,
         ).fit_transform(E_gpu)
 
         hdb = cuHDBSCAN(
@@ -219,14 +206,15 @@ def run_one(E_pca: np.ndarray, n_neighbors: int, min_dist: float,
     from sklearn.cluster import HDBSCAN
     from sklearn.metrics import silhouette_score
 
+    # UMAP 8448D → 20D per clustering
     Z = umap.UMAP(
-        n_components = UMAP_N_COMPONENTS,
+        n_components = UMAP_N_COMPONENTS,     # 20D
         n_neighbors  = n_neighbors,
         min_dist     = min_dist,
         metric       = "euclidean",
         random_state = RANDOM_STATE,
         low_memory   = True,
-        n_epochs     = 150,
+        n_epochs     = 100,
         n_jobs       = 1,
     ).fit_transform(E_pca)
 
@@ -486,7 +474,12 @@ def _to_df(results: list) -> pd.DataFrame:
 #  Final run con best params  (GPU se disponibile)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def final_run(E_pca: np.ndarray, best: dict, use_gpu: bool):
+def final_run(E: np.ndarray, best: dict, use_gpu: bool):
+    """
+    Due passi:
+      1. UMAP 8448D → 20D  (best params)  → HDBSCAN → labels
+      2. UMAP 20D  →  2D   (fisso)        → coordinate per visualizzazione
+    """
     import ray
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True, log_to_driver=False)
 
@@ -495,18 +488,35 @@ def final_run(E_pca: np.ndarray, best: dict, use_gpu: bool):
           f"mcs={int(best['min_cluster_size'])}  "
           f"score={float(best['dbcv']):.4f}")
     print(f"  Backend: {'GPU (cuML)' if use_gpu else 'CPU (umap-learn)'}")
+    print(f"  Step 1: UMAP {E.shape[1]}D → {UMAP_N_COMPONENTS}D → HDBSCAN")
+    print(f"  Step 2: UMAP {UMAP_N_COMPONENTS}D → {UMAP_VIZ_COMPONENTS}D (visualizzazione)")
 
     if use_gpu:
         @ray.remote(num_gpus=1)
         def _run(E, nn, md, mcs):
             import numpy as np
-            _cuml_preload()
+            import os, glob, ctypes as _ctypes
+            _B = "/usr/local/lib/python3.12/dist-packages"
+            _dirs = (glob.glob(f"{_B}/nvidia/*/lib")   + glob.glob(f"{_B}/nvidia/*/lib64") +
+                     glob.glob(f"{_B}/*/lib64")         + glob.glob(f"{_B}/*.libs"))
+            if _dirs:
+                os.environ["LD_LIBRARY_PATH"] = ":".join(_dirs)
+            for _lib in [f"{_B}/rapids_logger/lib64/librapids_logger.so",
+                         f"{_B}/librmm/lib64/librmm.so",
+                         f"{_B}/libraft/lib64/libraft.so",
+                         f"{_B}/libcuml/lib64/libcuml++.so"]:
+                if os.path.exists(_lib):
+                    try: _ctypes.CDLL(_lib, mode=_ctypes.RTLD_GLOBAL)
+                    except OSError: pass
+
             from cuml.manifold import UMAP   as cuUMAP
             from cuml.cluster  import HDBSCAN as cuHDBSCAN
             import cupy as cp
 
             E_gpu = cp.asarray(E.astype(np.float32))
-            Z_gpu = cuUMAP(
+
+            # Step 1: clustering (20D)
+            Z20_gpu = cuUMAP(
                 n_components = UMAP_N_COMPONENTS,
                 n_neighbors  = int(nn),
                 min_dist     = float(md),
@@ -520,15 +530,28 @@ def final_run(E_pca: np.ndarray, best: dict, use_gpu: bool):
                 cluster_selection_method = "eom",
                 gen_min_span_tree        = True,
             )
-            hdb.fit(Z_gpu)
-            return cp.asnumpy(Z_gpu).astype(np.float32), \
-                   cp.asnumpy(hdb.labels_).astype(np.int16)
+            hdb.fit(Z20_gpu)
+            labels = cp.asnumpy(hdb.labels_).astype(np.int16)
+
+            # Step 2: visualizzazione (2D) partendo dai 20D
+            Z2_gpu = cuUMAP(
+                n_components = UMAP_VIZ_COMPONENTS,
+                n_neighbors  = 15,
+                min_dist     = 0.1,
+                metric       = "euclidean",
+                random_state = RANDOM_STATE,
+                n_epochs     = 300,
+            ).fit_transform(Z20_gpu)
+
+            return cp.asnumpy(Z2_gpu).astype(np.float32), labels
     else:
         @ray.remote(num_cpus=CPUS_PER_TASK)
         def _run(E, nn, md, mcs):
             import numpy as np, umap
             from sklearn.cluster import HDBSCAN
-            Z = umap.UMAP(
+
+            # Step 1: clustering (20D)
+            Z20 = umap.UMAP(
                 n_components = UMAP_N_COMPONENTS,
                 n_neighbors  = int(nn),
                 min_dist     = float(md),
@@ -542,14 +565,26 @@ def final_run(E_pca: np.ndarray, best: dict, use_gpu: bool):
                 min_cluster_size         = int(mcs),
                 metric                   = "euclidean",
                 cluster_selection_method = "eom",
-            ).fit_predict(Z)
-            return Z.astype(np.float32), labels.astype(np.int16)
+            ).fit_predict(Z20)
 
-    Z, labels = ray.get(_run.remote(
-        ray.put(E_pca),
+            # Step 2: visualizzazione (2D)
+            Z2 = umap.UMAP(
+                n_components = UMAP_VIZ_COMPONENTS,
+                n_neighbors  = 15,
+                min_dist     = 0.1,
+                metric       = "euclidean",
+                random_state = RANDOM_STATE,
+                low_memory   = True,
+                n_jobs       = -1,
+            ).fit_transform(Z20)
+
+            return Z2.astype(np.float32), labels.astype(np.int16)
+
+    Z_2d, labels = ray.get(_run.remote(
+        ray.put(E),
         best["n_neighbors"], best["min_dist"], best["min_cluster_size"]
     ))
-    return Z, labels
+    return Z_2d, labels
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -677,36 +712,30 @@ def main():
     print("═" * 65)
     print(f"  Ray     : {RAY_ADDRESS}")
     print(f"  Space   : {N_TRIALS} trials  full grid  (8×5×8)")
-    print(f"  PCA     : {PCA_COMPONENTS}D")
+    print(f"  UMAP    : {UMAP_N_COMPONENTS}D clustering  +  {UMAP_VIZ_COMPONENTS}D viz")
+    print(f"  Noise   : max {MAX_NOISE_FRAC:.0%}")
     print("─" * 65)
 
     # ── 1. Embeddings ────────────────────────────────────────────────────
-    print("\n[1/6] Loading embeddings...")
+    print("\n[1/5] Loading embeddings...")
     emb_df     = pd.read_parquet(Path(C.RESULTS_DIR) / "embeddings.parquet")
     timestamps = pd.to_datetime(emb_df["datetime"])
     E          = emb_df[[c for c in emb_df.columns
                           if c.startswith("emb_")]].values.astype(np.float32)
     print(f"  {len(E):,} windows × {E.shape[1]:,} dims")
 
-    # ── 2. PCA ──────────────────────────────────────────────────────────
-    print(f"\n[2/6] PCA ({E.shape[1]}D → {PCA_COMPONENTS}D)...")
-    E_pca, cum_var = pca_reduce(E, PCA_COMPONENTS)
-    print(f"  {E_pca.shape[1]} components  |  {cum_var:.1%} variance  |  "
-          f"shape {E_pca.shape}")
-
-    # ── 3. Grid search (con resume automatico) ───────────────────────────
+    # ── 2. Grid search (con resume automatico) ───────────────────────────
     if grid_path.exists():
-        print(f"\n[3/6] Grid results già presenti — carico da {grid_path}")
+        print(f"\n[2/5] Grid results già presenti — carico da {grid_path}")
         grid_df = pd.read_csv(grid_path)
         print(f"  {len(grid_df)} trial  |  "
               f"{grid_df['dbcv'].notna().sum()} validi")
     else:
-        print(f"\n[3/6] Grid search...")
-        # Retry automatico se la connessione Ray Client cade
+        print(f"\n[2/5] Grid search  ({E.shape[1]}D → {UMAP_N_COMPONENTS}D → HDBSCAN)...")
         MAX_CONN_RETRIES = 10
         for _attempt in range(MAX_CONN_RETRIES):
             try:
-                grid_df = grid_search(E_pca)
+                grid_df = grid_search(E)
                 break
             except ConnectionError as _e:
                 if _attempt < MAX_CONN_RETRIES - 1:
@@ -728,8 +757,8 @@ def main():
     print(f"\n  Top 5:")
     print(grid_df.dropna(subset=["dbcv"]).head(5).to_string(index=False))
 
-    # ── 4. Best params ───────────────────────────────────────────────────
-    print(f"\n[4/6] Best params...")
+    # ── 3. Best params ───────────────────────────────────────────────────
+    print(f"\n[3/5] Best params...")
     valid = grid_df.dropna(subset=["dbcv"])
     if valid.empty:
         raise RuntimeError("Nessun trial valido (tutti NaN).")
@@ -740,22 +769,21 @@ def main():
                    for k, v in best.items()}, f, indent=2)
     print(f"  Salvato → {best_path}")
 
-    # ── 5. Determina backend per final_run ──────────────────────────────
+    # ── 4. Final run ─────────────────────────────────────────────────────
     import ray
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True)
     use_gpu = int(ray.cluster_resources().get("GPU", 0)) > 0
     ray.shutdown()
 
-    # ── 6. Final run ─────────────────────────────────────────────────────
     if umap_path.exists() and regime_path.exists():
-        print(f"\n[5/6] Output finali già presenti — carico da disco.")
+        print(f"\n[4/5] Output finali già presenti — carico da disco.")
         umap_df   = pd.read_parquet(umap_path)
         Z         = umap_df[["umap_1", "umap_2"]].values
         regime_df = pd.read_parquet(regime_path)
         labels    = regime_df["regime"].values
     else:
-        print(f"\n[5/6] Final UMAP + HDBSCAN con best params...")
-        Z, labels = final_run(E_pca, best, use_gpu=use_gpu)
+        print(f"\n[4/5] Final UMAP + HDBSCAN con best params...")
+        Z, labels = final_run(E, best, use_gpu=use_gpu)
         pd.DataFrame({"datetime": timestamps,
                       "umap_1": Z[:, 0], "umap_2": Z[:, 1]}
                      ).to_parquet(umap_path, index=False)
@@ -765,8 +793,8 @@ def main():
         print(f"  Salvato → {umap_path}")
         print(f"  Salvato → {regime_path}")
 
-    # ── 7. Plot ──────────────────────────────────────────────────────────
-    print(f"\n[6/6] Plot...")
+    # ── 5. Plot ──────────────────────────────────────────────────────────
+    print(f"\n[5/5] Plot...")
     make_plots(grid_df, Z, labels, timestamps)
 
     # ── Report ────────────────────────────────────────────────────────────
