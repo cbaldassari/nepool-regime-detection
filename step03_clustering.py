@@ -299,9 +299,9 @@ def grid_search(E_pca: np.ndarray, ckpt_path: Path) -> pd.DataFrame:
     n_gpu = int(ray.cluster_resources().get("GPU", 0))
 
     if n_gpu > 0:
-        N_CONCURRENT = EXPECTED_GPUS   # forza sempre 3 slot — Ray aspetta la GPU se non ancora disponibile
+        N_CONCURRENT = n_gpu   # adattivo: usa tutte le GPU disponibili
         ray_run_one  = ray.remote(num_gpus=1)(run_one)
-        print(f"  Modalità GPU  — {n_gpu} GPU visibili ora  →  {N_CONCURRENT} slot (Ray schedula appena disponibili)")
+        print(f"  Modalità GPU  — {n_gpu} GPU  →  {N_CONCURRENT} concurrent tasks")
         print(f"  Backend       : cuML UMAP + cuML HDBSCAN (DBCV reale)")
     else:
         N_CONCURRENT = n_cpu // CPUS_PER_TASK
