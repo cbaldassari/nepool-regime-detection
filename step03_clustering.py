@@ -555,6 +555,17 @@ def main():
           flush=True)
 
     # ── 3. Grid search ───────────────────────────────────────────────────
+    REQUIRED_COLS = {"K", "cov_type", "bic", "aic", "silhouette"}
+    if grid_path.exists():
+        _tmp = pd.read_csv(grid_path)
+        if not REQUIRED_COLS.issubset(_tmp.columns):
+            print(f"\n[3/5] ⚠  grid_results.csv da run precedente "
+                  f"(colonne: {list(_tmp.columns)}) — non compatibile con GMM.")
+            print(f"  ↺  Cancello e rieseguo il grid search.")
+            grid_path.unlink()
+            if ckpt_path.exists():
+                ckpt_path.unlink()
+
     if grid_path.exists():
         print(f"\n[3/5] Grid results già presenti — carico da {grid_path.name}")
         grid_df = pd.read_csv(grid_path)
