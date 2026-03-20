@@ -64,7 +64,7 @@ CONTEXT_LEN   = C.MEAN_REVERSION["context_len"]  # 720h
 STRIDE_H      = 6
 CHRONOS_MODEL = "amazon/chronos-2"          # multivariate, 120M params, D_model 768
 N_GPUS        = 3                           # Ray actors (one per GPU)
-BATCH_SIZE    = 64                          # reduced from 256: OOM with 10ch×720steps×256 batch on RTX 3080 Ti
+BATCH_SIZE    = 32                          # reduced from 256: OOM with larger batches on RTX 3080 Ti (12 GB)
 MAX_RETRIES   = 3                           # Ray actor retries on node failure
 
 FEAT_COLS = [
