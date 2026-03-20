@@ -398,16 +398,18 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
         runtime_env={"pip": ["chronos-forecasting[chronos2]"]},
     )
 
-    # Auto-detect available GPUs in the cluster.
-    # N_GPUS is the configured maximum; actual actors = min(N_GPUS, cluster_gpus).
-    # When a new node joins the cluster, this picks it up automatically.
-    cluster_gpus = int(ray.cluster_resources().get("GPU", 0))
-    n_actors     = min(N_GPUS, cluster_gpus) if cluster_gpus > 0 else N_GPUS
-    if cluster_gpus != N_GPUS:
-        print(f"  ⚠  Cluster GPUs detected: {cluster_gpus}  (N_GPUS={N_GPUS}) "
-              f"→ using {n_actors} actors", flush=True)
-    else:
-        print(f"  ✓  Cluster GPUs: {cluster_gpus}  → {n_actors} actors", flush=True)
+    # Count DISTINCT alive nodes with at least 1 GPU.
+    # Using ray.nodes() instead of cluster_resources()["GPU"] avoids the case
+    # where a single node reports 2 GPU slots (causing SPREAD to put 2 actors there).
+    # n_actors = min(N_GPUS, n_gpu_nodes) → never more than 1 actor per node.
+    cluster_gpus  = int(ray.cluster_resources().get("GPU", 0))
+    gpu_nodes     = [n for n in ray.nodes()
+                     if n.get("Alive") and n.get("Resources", {}).get("GPU", 0) > 0]
+    n_gpu_nodes   = len(gpu_nodes)
+    n_actors      = min(N_GPUS, n_gpu_nodes) if n_gpu_nodes > 0 else 1
+    node_ips      = [n["NodeManagerAddress"] for n in gpu_nodes]
+    print(f"  ✓  GPU nodes: {n_gpu_nodes}  {node_ips}  →  {n_actors} actors  "
+          f"(cluster GPU slots: {cluster_gpus})", flush=True)
 
     # SPREAD placement group — guarantees 1 actor per node (never 2 on same node).
     # Prevents RAM OOM from 2 Chronos-2 instances loading simultaneously on same host.
@@ -416,10 +418,10 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
 
     pg = placement_group(
         [{"GPU": 1, "CPU": 1} for _ in range(n_actors)],
-        strategy="SPREAD",   # each bundle goes to a different node
+        strategy="STRICT_SPREAD",   # GUARANTEES 1 bundle per node — fails if impossible
     )
     ray.get(pg.ready(), timeout=60)
-    print(f"  Placement group SPREAD ready — {n_actors} bundles across nodes", flush=True)
+    print(f"  Placement group STRICT_SPREAD ready — {n_actors} bundles, 1 per node", flush=True)
 
     # Apply @ray.remote as a function (not decorator) — ChronosActor is module-level
     RemoteChronosActor = ray.remote(
