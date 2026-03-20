@@ -63,7 +63,7 @@ import config as C
 CONTEXT_LEN   = C.MEAN_REVERSION["context_len"]  # 720h
 STRIDE_H      = 6
 CHRONOS_MODEL = "amazon/chronos-2"          # multivariate, 120M params, D_model 768
-N_GPUS        = 2                           # 1 actor per node: node .10 OOMs RAM with 2 actors (Chronos-2 load)
+N_GPUS        = 8                           # max cap — actual actors = min(N_GPUS, cluster_gpus) auto-detected at runtime
 BATCH_SIZE    = 32                          # reduced from 256: OOM with larger batches on RTX 3080 Ti (12 GB)
 MAX_RETRIES   = 3                           # Ray actor retries on node failure
 
