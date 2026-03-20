@@ -64,7 +64,7 @@ CONTEXT_LEN   = C.MEAN_REVERSION["context_len"]  # 720h
 STRIDE_H      = 6
 CHRONOS_MODEL = "amazon/chronos-2"          # multivariate, 120M params, D_model 768
 N_GPUS        = 3                           # Ray actors (one per GPU)
-BATCH_SIZE    = 256                         # survival test: 0.30 GB VRAM at batch=32 → safe headroom for 256
+BATCH_SIZE    = 64                          # reduced from 256: OOM with 10ch×720steps×256 batch on RTX 3080 Ti
 MAX_RETRIES   = 3                           # Ray actor retries on node failure
 
 FEAT_COLS = [
@@ -423,7 +423,7 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     futures = [a.embed_chunk.remote(ref) for a, ref in zip(actors, chunk_refs)]
 
     print(f"\n  Dispatched {n} windows across {len(actors)} Ray actors", flush=True)
-    print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}", flush=True)
+    print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}  |  chunks : {len(chunks)}", flush=True)
 
     # Collect with ray.wait — processes results as they arrive
     collected = {}
