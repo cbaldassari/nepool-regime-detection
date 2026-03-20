@@ -423,29 +423,21 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     ray.get(pg.ready(), timeout=60)
     print(f"  Placement group STRICT_SPREAD ready — {n_actors} bundles, 1 per node", flush=True)
 
-    # Apply @ray.remote as a function (not decorator) — ChronosActor is module-level
+    # No auto-restart: when an actor dies we redistribute its work manually.
+    # max_restarts=0 lets failures surface immediately so we can failover.
     RemoteChronosActor = ray.remote(
         num_gpus=1,
-        max_restarts=MAX_RETRIES,
-        max_task_retries=MAX_RETRIES,
+        max_restarts=0,
+        max_task_retries=0,
     )(ChronosActor)
 
-    n        = len(windows)
-    chunk_sz = int(np.ceil(n / n_actors))
-    chunks   = [windows[i : i + chunk_sz] for i in range(0, n, chunk_sz)]
-
-    # ── Serialize chunks as plain Python tuples (bytes, shape, dtype_str) ────
-    # Ray Client (ray://) always uses pickle5 for data crossing the client↔cluster
-    # boundary.  pickle5 activates numpy's buffer protocol whose _frombuffer()
-    # signature differs between the client's numpy and the cluster's numpy, causing:
-    #   TypeError: _frombuffer() takes 4 positional arguments but 5 were given
-    # Workaround: convert each numpy chunk to (raw_bytes, shape, dtype_str).
-    # bytes literals are serialised by pickle as plain data — no buffer protocol,
-    # no numpy ABI dependency.  The actor reconstructs via np.frombuffer().
-    # The same encoding is used for the return value (see ChronosActor.embed_chunk).
-    print(f"  Serialising {len(chunks)} chunks as bytes payloads …", flush=True)
-    payloads   = [(c.tobytes(), c.shape, c.dtype.str) for c in chunks]
-    chunk_refs = [ray.put(p) for p in payloads]
+    # ── Split work into fine-grained batches (not 1 chunk per actor) ─────────
+    # Each batch = BATCH_SIZE windows.  Batches are dispatched dynamically to
+    # whichever actor is free.  If an actor dies, its in-flight batch is
+    # re-queued and sent to a surviving actor automatically.
+    n           = len(windows)
+    all_batches = [windows[i : i + BATCH_SIZE] for i in range(0, n, BATCH_SIZE)]
+    n_batches   = len(all_batches)
 
     actors = [
         RemoteChronosActor.options(
@@ -454,32 +446,104 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
                 placement_group_bundle_index=i,
             )
         ).remote(CHRONOS_MODEL)
-        for i in range(len(chunk_refs))
+        for i in range(n_actors)
     ]
-    futures = [a.embed_chunk.remote(ref) for a, ref in zip(actors, chunk_refs)]
 
-    print(f"\n  Dispatched {n} windows across {len(actors)} Ray actors (SPREAD)", flush=True)
-    print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}  |  chunks : {len(chunks)}  |  cluster GPUs : {cluster_gpus}", flush=True)
+    print(f"\n  {n} windows  →  {n_batches} batches × {BATCH_SIZE}  |  "
+          f"{n_actors} actors  |  cluster GPUs: {cluster_gpus}", flush=True)
 
-    # Collect with ray.wait — processes results as they arrive
-    collected = {}
-    pending   = list(futures)
-    n_done    = 0
+    # ── Dynamic dispatch with failover ────────────────────────────────────────
+    # pending_queue : batches not yet dispatched
+    # flight        : { future : (actor_idx, batch_idx, batch_data) }
+    # dead_actors   : set of actor indices that have crashed
+    # results       : { batch_idx : np.ndarray }
+    pending_queue = list(range(n_batches))   # batch indices to process
+    flight        = {}                       # future → (actor_idx, batch_idx, batch)
+    dead_actors   = set()
+    results       = {}
+    actor_busy    = [False] * n_actors
 
-    while pending:
-        done, pending = ray.wait(pending, num_returns=1, timeout=600)
-        for f in done:
-            # Result is also a bytes tuple — reconstruct numpy here on the client
-            raw_bytes, shape, dtype_str = ray.get(f)
-            arr = np.frombuffer(raw_bytes, dtype=np.dtype(dtype_str)).reshape(shape).copy()
-            collected[futures.index(f)] = arr
+    def _alive_actors():
+        return [i for i in range(n_actors) if i not in dead_actors]
+
+    def _dispatch_next(actor_idx):
+        """Send next queued batch to actor_idx. Returns False if queue empty."""
+        if not pending_queue:
+            return False
+        bidx  = pending_queue.pop(0)
+        batch = all_batches[bidx]
+        payload = (batch.tobytes(), batch.shape, batch.dtype.str)
+        ref  = ray.put(payload)
+        fut  = actors[actor_idx].embed_chunk.remote(ref)
+        flight[fut] = (actor_idx, bidx, batch)
+        actor_busy[actor_idx] = True
+        return True
+
+    # Initial dispatch: 1 batch per alive actor
+    for i in _alive_actors():
+        _dispatch_next(i)
+
+    n_done = 0
+    while flight:
+        done_refs, _ = ray.wait(list(flight.keys()), num_returns=1, timeout=300)
+
+        if not done_refs:
+            # Timeout — cancel all in-flight and requeue
+            print(f"  ⏱  timeout waiting for results — requeuing in-flight batches",
+                  flush=True)
+            for fut, (aidx, bidx, batch) in list(flight.items()):
+                pending_queue.insert(0, bidx)
+                dead_actors.add(aidx)
+                try: ray.cancel(fut, force=True)
+                except Exception: pass
+            flight.clear()
+            alive = _alive_actors()
+            if not alive:
+                raise RuntimeError("All Ray actors are dead — cannot continue.")
+            for i in alive:
+                _dispatch_next(i)
+            continue
+
+        fut = done_refs[0]
+        actor_idx, bidx, batch = flight.pop(fut)
+        actor_busy[actor_idx]  = False
+
+        try:
+            raw_bytes, shape, dtype_str = ray.get(fut)
+            arr = np.frombuffer(raw_bytes,
+                                dtype=np.dtype(dtype_str)).reshape(shape).copy()
+            results[bidx] = arr
             n_done += 1
-            pct = n_done / len(futures) * 100
+            pct = n_done / n_batches * 100
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-            print(f"  RAY [{bar}] {n_done}/{len(futures)}  ({pct:>5.1f}%)", flush=True)
+            print(f"  RAY [{bar}] {n_done}/{n_batches} batches  ({pct:>5.1f}%)  "
+                  f"actor={actor_idx}", flush=True)
+        except Exception as e:
+            # Actor crashed — mark dead, requeue batch, dispatch to surviving actors
+            print(f"  ⚠  actor {actor_idx} died ({type(e).__name__}) — "
+                  f"requeuing batch {bidx}, redistributing to survivors", flush=True)
+            dead_actors.add(actor_idx)
+            pending_queue.insert(0, bidx)   # put failed batch back at front
+
+            alive = _alive_actors()
+            if not alive:
+                raise RuntimeError(
+                    f"All {n_actors} Ray actors are dead. "
+                    f"Processed {n_done}/{n_batches} batches before failure."
+                )
+            print(f"  ✓  Surviving actors: {alive}", flush=True)
+
+        # Keep alive actors busy
+        for i in _alive_actors():
+            if not actor_busy[i]:
+                dispatched = _dispatch_next(i)
+                if dispatched:
+                    actor_busy[i] = True
 
     ray.shutdown()
-    return np.concatenate([collected[i] for i in range(len(futures))], axis=0)
+    # Reconstruct in original order
+    ordered = np.concatenate([results[i] for i in range(n_batches)], axis=0)
+    return ordered
 
 
 # ═══════════════════════════════════════════════════════════════════════════
