@@ -415,7 +415,7 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     pg = placement_group(
-        [{"GPU": 1} for _ in range(n_actors)],
+        [{"GPU": 1, "CPU": 1} for _ in range(n_actors)],
         strategy="SPREAD",   # each bundle goes to a different node
     )
     ray.get(pg.ready(), timeout=60)
