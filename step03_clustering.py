@@ -1083,6 +1083,12 @@ def main():
             if p.exists():
                 p.unlink()
                 print(f"  [fresh] rimosso {p.name}")
+        # Pulisce tutti i PNG di step03 (evita plot stale da run precedenti
+        # con numero di regimi diverso o naming scheme diverso)
+        if PLOT_DIR.exists():
+            for png in PLOT_DIR.glob("*.png"):
+                png.unlink()
+                print(f"  [fresh] rimosso {png.name}")
 
     print("\n" + "═" * 65)
     print("  NEPOOL Regime Detection  —  Step 03: UMAP + Grid + HDBSCAN")
