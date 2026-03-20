@@ -409,6 +409,18 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     else:
         print(f"  ✓  Cluster GPUs: {cluster_gpus}  → {n_actors} actors", flush=True)
 
+    # SPREAD placement group — guarantees 1 actor per node (never 2 on same node).
+    # Prevents RAM OOM from 2 Chronos-2 instances loading simultaneously on same host.
+    from ray.util.placement_group import placement_group, remove_placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    pg = placement_group(
+        [{"GPU": 1} for _ in range(n_actors)],
+        strategy="SPREAD",   # each bundle goes to a different node
+    )
+    ray.get(pg.ready(), timeout=60)
+    print(f"  Placement group SPREAD ready — {n_actors} bundles across nodes", flush=True)
+
     # Apply @ray.remote as a function (not decorator) — ChronosActor is module-level
     RemoteChronosActor = ray.remote(
         num_gpus=1,
@@ -433,10 +445,18 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     payloads   = [(c.tobytes(), c.shape, c.dtype.str) for c in chunks]
     chunk_refs = [ray.put(p) for p in payloads]
 
-    actors  = [RemoteChronosActor.remote(CHRONOS_MODEL) for _ in range(len(chunk_refs))]
+    actors = [
+        RemoteChronosActor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=i,
+            )
+        ).remote(CHRONOS_MODEL)
+        for i in range(len(chunk_refs))
+    ]
     futures = [a.embed_chunk.remote(ref) for a, ref in zip(actors, chunk_refs)]
 
-    print(f"\n  Dispatched {n} windows across {len(actors)} Ray actors", flush=True)
+    print(f"\n  Dispatched {n} windows across {len(actors)} Ray actors (SPREAD)", flush=True)
     print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}  |  chunks : {len(chunks)}  |  cluster GPUs : {cluster_gpus}", flush=True)
 
     # Collect with ray.wait — processes results as they arrive
