@@ -267,9 +267,12 @@ def embed_batch_chronos(pipeline, batch: np.ndarray, device: str) -> np.ndarray:
     # DataLoader has pin_memory=True, which only works on dense CPU tensors.
     x = torch.tensor(batch.transpose(0, 2, 1), dtype=torch.float32)  # CPU
 
-    # Single call — pipeline handles internal batching via batch_size param
+    # batch_size controls how many windows Chronos processes simultaneously on GPU.
+    # Keeping it small (4) limits peak VRAM: with 10ch×720steps the activations
+    # for a full batch of 32 exceed 12 GB on RTX 3080 Ti.
     # emb_list: list of B tensors, each (F, num_patches+2, D_model)
-    emb_list, _ = pipeline.embed(x, batch_size=B)
+    EMBED_BATCH = 4
+    emb_list, _ = pipeline.embed(x, batch_size=EMBED_BATCH)
 
     all_embs = []
     for emb in emb_list:
