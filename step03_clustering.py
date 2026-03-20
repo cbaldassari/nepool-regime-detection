@@ -1089,13 +1089,12 @@ def main():
     print("═" * 65)
     print(f"  Ray     : {RAY_ADDRESS}")
     print(f"  Space   : {N_TRIALS} trials  full grid  (8×5×8)")
-    print(f"  Pipeline: 7680D (raw embeddings) →[cuML UMAP]→ {UMAP_N_COMPONENTS}D →[cuML HDBSCAN]")
+    print(f"  Pipeline: 7680D →[PCA]→ 256D →[cuML UMAP]→ {UMAP_N_COMPONENTS}D →[cuML HDBSCAN]")
     print(f"  Viz     : {UMAP_N_COMPONENTS}D →[UMAP]→ {UMAP_VIZ_COMPONENTS}D")
     print(f"  Noise   : max {MAX_NOISE_FRAC:.0%}  |  Max regimi: {MAX_CLUSTERS}")
     print("─" * 65)
 
     # ── 1. Carica embeddings raw (prodotto da step02) ────────────────────
-    # PCA rimossa: cuML UMAP gestisce 7680D direttamente su GPU.
     print("\n[1/5] Loading embeddings raw (da step02)...")
     if not emb_raw_path.exists():
         raise FileNotFoundError(
@@ -1107,6 +1106,21 @@ def main():
     E          = emb_df[[c for c in emb_df.columns
                           if c.startswith("emb_")]].values.astype(np.float32)
     print(f"  {len(E):,} windows × {E.shape[1]} dims  ← {emb_raw_path.name}", flush=True)
+
+    # ── PCA pre-riduzione 7680D → 256D (lato client, prima di Ray) ───────
+    # cuML UMAP su 7680D richiede diversi minuti per task → Ray Client
+    # (ray://) va in timeout per inattività gRPC durante la computazione.
+    # PCA a 256D: sklearn su CPU, ~10s, riduce il tempo UMAP di 10-50×
+    # senza perdita significativa di qualità (UMAP è robusta alla pre-PCA).
+    PCA_COMPONENTS = 256
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA as _PCA
+    print(f"  PCA {E.shape[1]}D → {PCA_COMPONENTS}D (pre-riduzione per UMAP)...", flush=True)
+    E_scaled = StandardScaler().fit_transform(E)
+    pca      = _PCA(n_components=PCA_COMPONENTS, random_state=42, svd_solver="randomized")
+    E        = pca.fit_transform(E_scaled).astype(np.float32)
+    var_exp  = pca.explained_variance_ratio_.sum()
+    print(f"  ✓ PCA → {E.shape[1]}D  (varianza spiegata: {var_exp:.1%})", flush=True)
 
     # ── 2. Grid search (con resume automatico via checkpoint CSV) ────────
     # Passo 1: se esiste un CSV verifica che la griglia salvata coincida con
