@@ -398,6 +398,17 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
         runtime_env={"pip": ["chronos-forecasting[chronos2]"]},
     )
 
+    # Auto-detect available GPUs in the cluster.
+    # N_GPUS is the configured maximum; actual actors = min(N_GPUS, cluster_gpus).
+    # When a new node joins the cluster, this picks it up automatically.
+    cluster_gpus = int(ray.cluster_resources().get("GPU", 0))
+    n_actors     = min(N_GPUS, cluster_gpus) if cluster_gpus > 0 else N_GPUS
+    if cluster_gpus != N_GPUS:
+        print(f"  ⚠  Cluster GPUs detected: {cluster_gpus}  (N_GPUS={N_GPUS}) "
+              f"→ using {n_actors} actors", flush=True)
+    else:
+        print(f"  ✓  Cluster GPUs: {cluster_gpus}  → {n_actors} actors", flush=True)
+
     # Apply @ray.remote as a function (not decorator) — ChronosActor is module-level
     RemoteChronosActor = ray.remote(
         num_gpus=1,
@@ -406,7 +417,7 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     )(ChronosActor)
 
     n        = len(windows)
-    chunk_sz = int(np.ceil(n / N_GPUS))
+    chunk_sz = int(np.ceil(n / n_actors))
     chunks   = [windows[i : i + chunk_sz] for i in range(0, n, chunk_sz)]
 
     # ── Serialize chunks as plain Python tuples (bytes, shape, dtype_str) ────
@@ -426,7 +437,7 @@ def extract_ray(windows: np.ndarray) -> np.ndarray:
     futures = [a.embed_chunk.remote(ref) for a, ref in zip(actors, chunk_refs)]
 
     print(f"\n  Dispatched {n} windows across {len(actors)} Ray actors", flush=True)
-    print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}  |  chunks : {len(chunks)}", flush=True)
+    print(f"  Batch size / actor : {BATCH_SIZE}  |  max_retries : {MAX_RETRIES}  |  chunks : {len(chunks)}  |  cluster GPUs : {cluster_gpus}", flush=True)
 
     # Collect with ray.wait — processes results as they arrive
     collected = {}
