@@ -97,9 +97,16 @@ def run_local(script: str, *args: str, label: str = "") -> bool:
     return ret.returncode == 0
 
 
+def _progress_bar(done: int, total: int, width: int = 30) -> str:
+    filled = int(width * done / max(total, 1))
+    bar    = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {done}/{total}"
+
+
 def run_parallel_ray(ray_run, tasks: list[tuple], label: str) -> list[str]:
     """
     Sottomette una lista di task Ray e aspetta il completamento.
+    Mostra una barra di progresso man mano che i task terminano.
 
     tasks: lista di (script, args_list, task_label, num_cpus, num_gpus)
     Restituisce lista di label falliti.
@@ -107,21 +114,38 @@ def run_parallel_ray(ray_run, tasks: list[tuple], label: str) -> list[str]:
     import ray
 
     bar = "=" * 65
-    print(f"\n{bar}\n  {label}  ({len(tasks)} task Ray)\n{bar}", flush=True)
+    n   = len(tasks)
+    print(f"\n{bar}\n  {label}  ({n} task Ray)\n{bar}", flush=True)
 
-    futures = []
+    # sottometti tutti i task
+    pending = {}   # future -> task_label
     for script, args, task_label, n_cpu, n_gpu in tasks:
         remote_fn = ray_run.options(num_cpus=n_cpu, num_gpus=n_gpu)
-        futures.append((task_label, remote_fn.remote(script, args, task_label)))
+        fut = remote_fn.remote(script, args, task_label)
+        pending[fut] = task_label
+        print(f"  >> sottomesso: {task_label}", flush=True)
 
+    # attendi con barra di progresso
+    print(flush=True)
+    done   = 0
     failed = []
-    for task_label, fut in futures:
-        lbl, ok, elapsed = ray.get(fut)
-        status = "OK  " if ok else "FAIL"
-        print(f"  [{status}] {lbl}  ({elapsed:.1f}s)", flush=True)
-        if not ok:
-            failed.append(task_label)
+    remaining = list(pending.keys())
 
+    while remaining:
+        # ray.wait restituisce appena almeno 1 task e' pronto
+        ready, remaining = ray.wait(remaining, num_returns=1, timeout=None)
+        for fut in ready:
+            lbl, ok, elapsed = ray.get(fut)
+            done += 1
+            status = "OK  " if ok else "FAIL"
+            print(f"  [{status}] {lbl}  ({elapsed:.1f}s)  "
+                  f"{_progress_bar(done, n)}", flush=True)
+            if not ok:
+                failed.append(lbl)
+
+    print(f"\n  Completati: {done}/{n}  "
+          f"({'tutti OK' if not failed else f'{len(failed)} falliti'})",
+          flush=True)
     return failed
 
 
