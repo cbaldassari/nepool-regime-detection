@@ -6,25 +6,39 @@ ISONE Electricity Market — Geometry-Driven Regime Identification
 
 Input  : isone_dataset.parquet  (43,789 rows × 22 cols, 2021–2025)
 Output : results/preprocessed.parquet
-Plots  : results/step01/  (8 diagnostic figures)
+Plots  : results/step01/  (5 diagnostic figures)
 
-Features produced (11 columns)
+Features produced (8 columns)
 -------------------------------
-  1.  lmp        — raw LMP $/MWh
-  2.  arcsinh_lmp — arcsinh(LMP), handles negative prices natively
-  3.  log_return  — first difference of arcsinh_lmp, lag 1h
-  4.  total_mw   — total generation MW (scale complement to ILR composition)
-  5.  ilr_1 … ilr_7 — Isometric Log-Ratio of fuel mix (7 coordinates)
+  1.  lmp                  — raw LMP $/MWh
+  2.  arcsinh_lmp          — arcsinh(LMP), handles negative prices natively
+  3.  log_return           — first difference of arcsinh_lmp, lag 1h
+  4.  mstl_resid_arcsinh   — MSTL residual of arcsinh_lmp (periods 24h/168h/8760h)
+  5.  mstl_resid_lr        — MSTL residual of log_return
+  6.  log_lmp_shifted      — log(LMP - min(LMP) + 1), log scale with shift for negatives
+  7.  lmp_clipped          — LMP winsorized at [1st, 99th] percentile
+  8.  mstl_resid_log       — MSTL residual of log_lmp_shifted
+
+Experiments A-G (used in step02_embeddings.py)
+-----------------------------------------------
+  A: log_return           — stationary, short-memory dynamics
+  B: arcsinh_lmp          — price level, negative-safe
+  C: mstl_resid_lr        — deseasonalized return
+  D: mstl_resid_arcsinh   — deseasonalized level (best in TOPSIS)
+  E: log_lmp_shifted      — log-scale level (alternative to arcsinh)
+  F: lmp_clipped          — raw level without extreme spikes
+  G: mstl_resid_log       — deseasonalized log-level
 
 Design choices
 --------------
   • No standardisation: Chronos-2 normalises each channel per-window internally.
   • No detrending: same reason — per-window normalisation removes local trend.
-  • signed_log for LMP: handles negative prices (oversupply events) correctly.
-  • ILR over raw shares: embeds compositional data in Euclidean space (Aitchison
-    geometry), removing the unit-sum constraint and enabling proper distance
-    computation in downstream clustering.
-  • SBP design is economically motivated (ISONE merit order).
+  • arcsinh for LMP: handles negative prices (oversupply events) correctly.
+  • log_lmp_shifted: log(LMP + shift) where shift = max(0, -min_lmp) + 1.
+    Classic log scale; grows slower than arcsinh for large prices.
+  • lmp_clipped: winsorize at [p1, p99] to reduce spike influence on the encoder.
+  • total_mw and ILR coordinates (ilr_1…ilr_7) are intentionally excluded:
+    they are not passed to Chronos-2 in any of the A-G experiments.
 
 Dependencies: pandas, numpy, matplotlib, seaborn, tqdm
 """
@@ -50,103 +64,11 @@ sys.stderr.reconfigure(encoding="utf-8")
 sys.path.insert(0, str(Path(__file__).parent))
 import config as C
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ILR configuration
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Sequential Binary Partition — economically motivated (merit order ISONE)
-# Column order: Gas(0) Nuc(1) Hyd(2) Win(3) Sol(4) Coa(5) Oil(6) Oth(7)
-#
-#        Gas  Nuc  Hyd  Win  Sol  Coa  Oil  Oth
-SBP = np.array([
-    [ 1,   1,  -1,  -1,  -1,   1,   1,   1],   # ILR1: Dispatchable vs Variable
-    [ 1,  -1,   0,   0,   0,   1,   1,  -1],   # ILR2: Fossil vs Non-fossil
-    [ 1,   0,   0,   0,   0,  -1,  -1,   0],   # ILR3: Gas vs Coal+Oil
-    [ 0,   0,   0,   0,   0,   1,  -1,   0],   # ILR4: Coal vs Oil
-    [ 0,   1,   0,   0,   0,   0,   0,  -1],   # ILR5: Nuclear vs Other
-    [ 0,   0,   1,  -1,  -1,   0,   0,   0],   # ILR6: Hydro vs Intermittent
-    [ 0,   0,   0,  -1,   1,   0,   0,   0],   # ILR7: Solar vs Wind (Solar+, Wind-)
-], dtype=float)
-
-ILR_LABELS = [
-    "ILR1\nDispatchable\nvs Variable",
-    "ILR2\nFossil\nvs Non-fossil",
-    "ILR3\nGas\nvs Coal+Oil",
-    "ILR4\nCoal\nvs Oil",
-    "ILR5\nNuclear\nvs Other",
-    "ILR6\nHydro\nvs Intermittent",
-    "ILR7\nSolar\nvs Wind",
-]
-
-FUEL_COLS  = C.ILR["fuel_cols"]   # ordered: gas, nuc, hyd, win, sol, coa, oil, oth
-DELTA      = C.ILR["zero_replacement_delta"]
-PLOT_DIR   = Path(C.RESULTS_DIR) / "step01"
+PLOT_DIR = Path(C.RESULTS_DIR) / "step01"
 
 FUEL_DISPLAY = ["Gas", "Nuclear", "Hydro", "Wind", "Solar", "Coal", "Oil", "Other"]
 FUEL_COLORS  = ["#e07b39", "#7b52ab", "#4da6e8", "#6abf69", "#f7c948",
                 "#5a5a5a", "#b04040", "#aaaaaa"]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ILR — forward transform
-# ═══════════════════════════════════════════════════════════════════════════
-
-def zero_replace(shares: np.ndarray, delta: float) -> np.ndarray:
-    """
-    Multiplicative zero replacement (Martín-Fernández et al., 2003).
-    Replaces non-positive values (zeros AND negatives) with delta,
-    then renormalises rows to sum to 1.
-
-    Negative fuel shares are physically impossible and treated as
-    reporting artefacts (same as zeros for compositional purposes).
-    Using s <= 0 prevents np.log() from receiving invalid inputs.
-    """
-    s = shares.copy()
-    s[s <= 0] = delta
-    s = s / s.sum(axis=1, keepdims=True)
-    return s
-
-
-def ilr_transform(shares: np.ndarray, sbp: np.ndarray) -> np.ndarray:
-    """
-    Forward ILR transform given a Sequential Binary Partition.
-    Returns (N, D-1) matrix of ILR coordinates.
-    """
-    log_s    = np.log(shares)
-    n_coords = sbp.shape[0]
-    ilr      = np.zeros((len(shares), n_coords))
-    for j, row in enumerate(sbp):
-        pos   = row ==  1
-        neg   = row == -1
-        r, s  = pos.sum(), neg.sum()
-        coeff = np.sqrt((r * s) / (r + s))
-        ilr[:, j] = coeff * (log_s[:, pos].mean(axis=1) - log_s[:, neg].mean(axis=1))
-    return ilr
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ILR — inverse transform
-# ═══════════════════════════════════════════════════════════════════════════
-
-def ilr_basis(sbp: np.ndarray) -> np.ndarray:
-    """Build the (D-1) × D orthonormal ILR basis matrix Ψ from the SBP."""
-    n_coords, D = sbp.shape
-    Psi = np.zeros((n_coords, D))
-    for j, row in enumerate(sbp):
-        pos = row ==  1
-        neg = row == -1
-        r, s = pos.sum(), neg.sum()
-        Psi[j, pos] =  np.sqrt(s / (r * (r + s)))
-        Psi[j, neg] = -np.sqrt(r / (s * (r + s)))
-    return Psi
-
-
-def ilr_inverse(ilr: np.ndarray, sbp: np.ndarray) -> np.ndarray:
-    """Inverse ILR: ILR coordinates → fuel shares via CLR → softmax."""
-    Psi   = ilr_basis(sbp)
-    clr   = ilr @ Psi
-    exp_c = np.exp(clr)
-    return exp_c / exp_c.sum(axis=1, keepdims=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -156,31 +78,37 @@ def ilr_inverse(ilr: np.ndarray, sbp: np.ndarray) -> np.ndarray:
 def build_price_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build price-derived features.
-      arcsinh_lmp : arcsinh(LMP) — handles negative prices, no arbitrary clip needed
-      log_return  : first difference of arcsinh_lmp (≈ arithmetic return for small Δ)
-                    NaN for the very first observation (no prior price available)
-      lmp         : raw LMP kept for plots and validation only (not passed to Chronos-2)
+      arcsinh_lmp     : arcsinh(LMP) — handles negative prices, no arbitrary clip needed
+      log_return      : first difference of arcsinh_lmp (≈ arithmetic return for small Δ)
+                        NaN for the very first observation (no prior price available)
+      lmp             : raw LMP kept for plots and validation
+      log_lmp_shifted : log(LMP + shift) where shift = max(0, -min_lmp) + 1.0
+                        Guarantees positivity before log; comparable to arcsinh but
+                        grows slower for large values.
+      lmp_clipped     : LMP winsorized at [1st, 99th] percentile — keeps scale intact
+                        but reduces influence of extreme spikes on the encoder.
     """
-    lmp          = df["lmp"].values.astype(np.float64)
-    arcsinh_lmp  = np.arcsinh(lmp)
-    log_ret      = np.empty(len(lmp))
-    log_ret[0]   = np.nan
-    log_ret[1:]  = np.diff(arcsinh_lmp)
-    return pd.DataFrame({"lmp": lmp, "arcsinh_lmp": arcsinh_lmp, "log_return": log_ret},
-                        index=df.index)
+    lmp         = df["lmp"].values.astype(np.float64)
+    arcsinh_lmp = np.arcsinh(lmp)
+    log_ret     = np.empty(len(lmp))
+    log_ret[0]  = np.nan
+    log_ret[1:] = np.diff(arcsinh_lmp)
 
+    # log_lmp_shifted: shift so that min(shifted) >= 1 before log
+    shift           = max(0.0, -lmp.min()) + 1.0
+    log_lmp_shifted = np.log(lmp + shift)
 
-def build_total_mw(df: pd.DataFrame) -> pd.DataFrame:
-    return pd.DataFrame({"total_mw": df["total_mw"].values.astype(np.float64)},
-                        index=df.index)
+    # lmp_clipped: winsorize at [p1, p99]
+    p1, p99   = np.percentile(lmp, 1), np.percentile(lmp, 99)
+    lmp_clipped = np.clip(lmp, p1, p99)
 
-
-def build_ilr_features(df: pd.DataFrame) -> pd.DataFrame:
-    shares = df[FUEL_COLS].values.astype(np.float64)
-    shares = zero_replace(shares, DELTA)
-    ilr    = ilr_transform(shares, SBP)
-    cols   = [f"ilr_{i+1}" for i in range(ilr.shape[1])]
-    return pd.DataFrame(ilr, columns=cols, index=df.index)
+    return pd.DataFrame({
+        "lmp"            : lmp,
+        "arcsinh_lmp"    : arcsinh_lmp,
+        "log_return"     : log_ret,
+        "log_lmp_shifted": log_lmp_shifted,
+        "lmp_clipped"    : lmp_clipped,
+    }, index=df.index)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,55 +132,6 @@ def run_checks(df_raw: pd.DataFrame, feat: pd.DataFrame) -> None:
     if n_zero_lmp:
         issues.append(f"lmp = 0: {n_zero_lmp} rows  ← clipped to 1e-3 for log")
 
-    # total_mw negative
-    n_neg_mw = (feat["total_mw"] < 0).sum()
-    if n_neg_mw:
-        issues.append(f"total_mw < 0: {n_neg_mw} rows  ← possible EIA reporting artefact")
-
-    # ILR7 sign check: solar > wind at noon in summer → ILR7 > 0
-    tmp = df_raw.copy()
-    tmp["hour"]  = pd.to_datetime(tmp["datetime"]).dt.hour
-    tmp["month"] = pd.to_datetime(tmp["datetime"]).dt.month
-    noon_idx = tmp[(tmp["hour"] == 12) & (tmp["month"].isin([6, 7, 8]))].index
-    noon_idx = noon_idx[noon_idx < len(feat)]
-    if len(noon_idx):
-        ilr7_noon = feat.loc[noon_idx, "ilr_7"].mean()
-        sign_ok   = ilr7_noon > 0
-        issues.append(
-            f"ILR7 mean at noon (Jun–Aug): {ilr7_noon:.3f}  "
-            f"{'✓ Solar > Wind' if sign_ok else '✗ SIGN ERROR'}"
-        )
-
-    # Fuel shares sum check
-    fuel_vals  = df_raw[FUEL_COLS].values.astype(np.float64)
-    row_sums   = fuel_vals.sum(axis=1)
-    bad_sum    = np.abs(row_sums - 1.0) > 1e-4
-    n_bad_sum  = bad_sum.sum()
-    if n_bad_sum:
-        issues.append(
-            f"fuel shares row-sum ≠ 1: {n_bad_sum} rows  "
-            f"(max deviation {np.abs(row_sums[bad_sum] - 1.0).max():.2e})  ✗ DATA QUALITY"
-        )
-    else:
-        issues.append(
-            f"fuel shares row-sum: max deviation {np.abs(row_sums - 1.0).max():.2e}  ✓"
-        )
-
-    # Fuel share non-positive values
-    n_nonpos = (fuel_vals <= 0).sum()
-    if n_nonpos:
-        issues.append(
-            f"fuel shares ≤ 0: {n_nonpos} cells replaced with δ={DELTA}"
-            f"  ({'negatives' if (fuel_vals < 0).any() else 'zeros only'})"
-        )
-
-    # ILR roundtrip
-    ilr_vals   = feat[[f"ilr_{i}" for i in range(1, 8)]].values
-    shares_rec = ilr_inverse(ilr_vals, SBP)
-    shares_raw = zero_replace(fuel_vals, DELTA)
-    max_err    = np.abs(shares_raw - shares_rec).max()
-    issues.append(f"ILR roundtrip max error: {max_err:.2e}  {'✓' if max_err < 1e-10 else '✗ ERROR'}")
-
     for msg in issues:
         print(f"    {'⚠' if '✗' in msg or 'artefact' in msg else '✓'}  {msg}")
 
@@ -263,17 +142,14 @@ def run_checks(df_raw: pd.DataFrame, feat: pd.DataFrame) -> None:
 
 def make_plots(out: pd.DataFrame, df_raw: pd.DataFrame) -> None:
     """
-    Generate 8 diagnostic figures and save to results/step01/.
+    Generate 5 diagnostic figures and save to results/step01/.
 
     Figure list:
       01_lmp_timeseries.png       — full LMP series with spike threshold
-      02_lmp_distribution.png     — LMP histogram + log-scale + signed_log overlay
+      02_lmp_distribution.png     — LMP histogram + log-scale
       03_log_return_distribution  — log_return histogram with normal fit + QQ plot
-      04_total_mw_profile.png     — total_mw by hour-of-day per season
-      05_fuel_mix_monthly.png     — monthly average fuel share stacked bar
-      06_ilr_boxplots.png         — boxplots of ILR 1–7 with SBP descriptions
-      07_ilr7_heatmap.png         — ILR7 mean by hour × month (Solar vs Wind)
-      08_feature_correlation.png  — Pearson correlation heatmap of all 11 features
+      04_fuel_mix_monthly.png     — monthly average fuel share stacked bar
+      05_feature_correlation.png  — Pearson correlation heatmap of price features
     """
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid", font_scale=0.9)
@@ -339,36 +215,7 @@ def make_plots(out: pd.DataFrame, df_raw: pd.DataFrame) -> None:
     fig.savefig(PLOT_DIR / "03_log_return_distribution.png")
     plt.close(fig)
 
-    # ── 04: total_mw hourly profile by season ───────────────────────────────
-    season_map = {12: "Winter", 1: "Winter", 2: "Winter",
-                  3: "Spring", 4: "Spring", 5: "Spring",
-                  6: "Summer", 7: "Summer", 8: "Summer",
-                  9: "Autumn", 10: "Autumn", 11: "Autumn"}
-    season_colors = {"Winter": "#4da6e8", "Spring": "#6abf69",
-                     "Summer": "#f7c948", "Autumn": "#e07b39"}
-    df_p = out.copy()
-    df_p["hour"]   = dt.dt.hour
-    df_p["season"] = dt.dt.month.map(season_map)
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for season in ["Winter", "Spring", "Summer", "Autumn"]:
-        sub = df_p[df_p["season"] == season].groupby("hour")["total_mw"]
-        med = sub.median()
-        q25 = sub.quantile(0.25)
-        q75 = sub.quantile(0.75)
-        ax.plot(med.index, med.values, lw=2, color=season_colors[season], label=season)
-        ax.fill_between(q25.index, q25.values, q75.values,
-                        color=season_colors[season], alpha=0.15)
-    ax.set_title("Total Generation MW — Median hourly profile by season (IQR shaded)",
-                 fontweight="bold")
-    ax.set_xlabel("Hour of day");  ax.set_ylabel("MW")
-    ax.set_xticks(range(0, 24, 2))
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "04_total_mw_profile.png")
-    plt.close(fig)
-
-    # ── 05: Monthly fuel mix stacked bar ────────────────────────────────────
+    # ── 04: Monthly fuel mix stacked bar ────────────────────────────────────
     df_raw2 = df_raw.copy()
     df_raw2["month"] = pd.to_datetime(df_raw2["datetime"]).dt.to_period("M")
     share_cols = [c + "_share" for c in
@@ -390,63 +237,28 @@ def make_plots(out: pd.DataFrame, df_raw: pd.DataFrame) -> None:
     ax.set_ylabel("Share (fraction)");  ax.set_ylim(0, 1)
     ax.legend(loc="upper right", ncol=4, fontsize=8)
     fig.tight_layout()
-    fig.savefig(PLOT_DIR / "05_fuel_mix_monthly.png")
+    fig.savefig(PLOT_DIR / "04_fuel_mix_monthly.png")
     plt.close(fig)
 
-    # ── 06: ILR boxplots ────────────────────────────────────────────────────
-    ilr_cols = [f"ilr_{i}" for i in range(1, 8)]
-    ilr_data = [out[c].values for c in ilr_cols]
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    bp = ax.boxplot(ilr_data, patch_artist=True, notch=False,
-                    medianprops=dict(color="black", lw=1.5),
-                    flierprops=dict(marker=".", markersize=1, alpha=0.3, color="gray"))
-    colors = plt.cm.tab10(np.linspace(0, 0.9, 7))
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color);  patch.set_alpha(0.7)
-    ax.axhline(0, color="black", lw=0.6, ls="--", alpha=0.5)
-    ax.set_xticks(range(1, 8))
-    ax.set_xticklabels(ILR_LABELS, fontsize=7.5)
-    ax.set_title("ILR coordinate distributions (SBP — ISONE merit order)",
-                 fontweight="bold")
-    ax.set_ylabel("ILR value")
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "06_ilr_boxplots.png")
-    plt.close(fig)
-
-    # ── 07: ILR7 heatmap (hour × month) ────────────────────────────────────
-    df_p["month_n"] = dt.dt.month
-    pivot = df_p.groupby(["month_n", "hour"])["ilr_7"].mean().unstack("hour")
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    sns.heatmap(pivot, ax=ax, cmap="RdYlGn", center=0,
-                xticklabels=range(0, 24, 1),
-                yticklabels=["Jan","Feb","Mar","Apr","May","Jun",
-                              "Jul","Aug","Sep","Oct","Nov","Dec"],
-                cbar_kws={"label": "ILR7  (Solar+ / Wind−)"})
-    ax.set_title("ILR7 mean by hour × month — Solar (green) vs Wind (red) dominance",
-                 fontweight="bold")
-    ax.set_xlabel("Hour of day");  ax.set_ylabel("")
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "07_ilr7_heatmap.png")
-    plt.close(fig)
-
-    # ── 08: Feature correlation heatmap ─────────────────────────────────────
-    feat_cols = ["lmp", "arcsinh_lmp", "log_return", "total_mw"] + ilr_cols
+    # ── 05: Feature correlation heatmap (price features only) ───────────────
+    feat_cols = ["lmp", "arcsinh_lmp", "log_return",
+                 "mstl_resid_arcsinh", "mstl_resid_lr",
+                 "log_lmp_shifted", "lmp_clipped", "mstl_resid_log"]
+    feat_cols = [c for c in feat_cols if c in out.columns]
     corr = out[feat_cols].corr()
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(7, 6))
     mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
     sns.heatmap(corr, ax=ax, mask=mask, cmap="coolwarm", vmin=-1, vmax=1,
-                annot=True, fmt=".2f", annot_kws={"size": 7},
+                annot=True, fmt=".2f", annot_kws={"size": 8},
                 linewidths=0.3, square=True,
                 cbar_kws={"shrink": 0.7})
-    ax.set_title("Pearson correlation — all 11 features", fontweight="bold")
+    ax.set_title("Pearson correlation — price features", fontweight="bold")
     fig.tight_layout()
-    fig.savefig(PLOT_DIR / "08_feature_correlation.png")
+    fig.savefig(PLOT_DIR / "05_feature_correlation.png")
     plt.close(fig)
 
-    print(f"  8 figures saved → {PLOT_DIR}/")
+    print(f"  5 figures saved → {PLOT_DIR}/")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -463,17 +275,15 @@ def main() -> pd.DataFrame:
     print(f"  Period : {C.DATASET['start_date']}  →  {C.DATASET['end_date']}")
     print(f"  Output : {C.RESULTS_DIR}/preprocessed.parquet")
     print(f"  Plots  : {PLOT_DIR}/")
-    print(f"  Config : standardise=OFF  detrend=OFF  delta={DELTA}")
     print()
     print("  This step loads the raw ISONE dataset, removes a small number")
     print("  of anomalous rows (DST duplicates, EIA artefacts), and builds")
-    print("  11 features for downstream embedding with Chronos-2:")
-    print("    • 3 price features (lmp, arcsinh_lmp, log_return)")
-    print("    • 1 demand proxy  (total_mw)")
-    print("    • 7 ILR coordinates encoding fuel mix composition")
+    print("  5 price features for downstream embedding with Chronos-2:")
+    print("    • lmp, arcsinh_lmp, log_return")
+    print("    • mstl_resid_arcsinh, mstl_resid_lr")
     print("─" * 65)
 
-    n_steps = 8
+    n_steps = 6
     def _step(n: int, label: str) -> None:
         print(f"  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -512,7 +322,6 @@ def main() -> pd.DataFrame:
             "datetime": row["datetime"],
             "reason":   "DST fall-back duplicate (kept first occurrence)",
             "lmp":      row["lmp"],
-            "total_mw": row["total_mw"],
         })
     df = df[~df.duplicated(subset=["datetime"], keep="first")].reset_index(drop=True)
 
@@ -527,7 +336,6 @@ def main() -> pd.DataFrame:
             "datetime": row["datetime"],
             "reason":   "EIA artefact: negative raw MW generation",
             "lmp":      row["lmp"],
-            "total_mw": row["total_mw"],
         })
     df = df[~neg_mw_mask].reset_index(drop=True)
 
@@ -543,11 +351,8 @@ def main() -> pd.DataFrame:
         gap_h     = int((gap_end - gap_start).total_seconds() / 3600)
         temporal_gaps.append({"from": gap_start, "to": gap_end, "gap_h": gap_h})
 
-    # 2c. Missing fuel shares
-    fuel_null = df[FUEL_COLS].isnull().all(axis=1)
-    n_dropped = fuel_null.sum()
-    if n_dropped:
-        df = df[~fuel_null].reset_index(drop=True)
+    # 2c. Missing price data
+    n_dropped = 0
 
     # 2d. Save audit log
     audit_path = Path(C.RESULTS_DIR) / "removed_rows.csv"
@@ -563,37 +368,40 @@ def main() -> pd.DataFrame:
     price = build_price_features(df)
     _done(3, "Price features")
 
-    # ── 4. Total MW ─────────────────────────────────────────────────────────
-    _step(4, "Total MW")
-    mw = build_total_mw(df)
-    _done(4, "Total MW")
-
-    # ── 5. ILR transform ────────────────────────────────────────────────────
-    _step(5, "ILR transform   (ilr_1 … ilr_7)")
-    ilr = build_ilr_features(df)
-    _done(5, "ILR transform")
-
-    # ── 6. Assembly & validation ────────────────────────────────────────────
-    _step(6, "Assembly & validation")
-    feat      = pd.concat([price, mw, ilr], axis=1)
+    # ── 4. Assembly & validation ─────────────────────────────────────────────
+    _step(4, "Assembly & validation")
+    feat      = price.copy()
     valid     = feat.notna().all(axis=1)
     feat      = feat[valid].reset_index(drop=True)
     df        = df[valid].reset_index(drop=True)
     df_clean  = df.copy()
     out       = pd.concat([df[["datetime"]], feat], axis=1)
-    _done(6, "Assembly & validation", f"{len(out):,} righe  ×  {out.shape[1]} colonne")
+    _done(4, "Assembly & validation", f"{len(out):,} righe  ×  {out.shape[1]} colonne")
 
-    # ── 7. Save ─────────────────────────────────────────────────────────────
-    _step(7, "Saving output")
+    # ── 5. MSTL deseasonalization ────────────────────────────────────────────
+    _step(5, "MSTL deseasonalization  (periodi: 24h, 168h, 8760h)")
+    from statsmodels.tsa.seasonal import MSTL
+    for src_col, dst_col in [("arcsinh_lmp",     "mstl_resid_arcsinh"),
+                              ("log_return",      "mstl_resid_lr"),
+                              ("log_lmp_shifted", "mstl_resid_log")]:
+        series = out[src_col].fillna(0).values
+        mstl   = MSTL(series, periods=[24, 168, 8760], windows=[25, 169, 8761])
+        res    = mstl.fit()
+        out[dst_col] = res.resid
+        print(f"    {src_col} -> {dst_col}  "
+              f"(resid std={res.resid.std():.4f})", flush=True)
+    _done(5, "MSTL deseasonalization",
+          "colonne aggiunte: mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log")
+
+    # ── 6. Save ──────────────────────────────────────────────────────────────
+    _step(6, "Saving output")
     out_path = Path(C.RESULTS_DIR) / "preprocessed.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_path, index=False)
-    _done(7, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(6, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
-    # ── 8. Plots ─────────────────────────────────────────────────────────────
-    _step(8, "Diagnostic plots")
+    # ── Plots ────────────────────────────────────────────────────────────────
     make_plots(out, df_clean)
-    _done(8, "Diagnostic plots", f"→ {PLOT_DIR}/")
 
     # ── Report ──────────────────────────────────────────────────────────────
     elapsed  = time.time() - t0
@@ -635,20 +443,10 @@ def main() -> pd.DataFrame:
     print("  FEATURE SUMMARY")
     print("─" * 65)
     print()
-    print("  Price features (lmp, arcsinh_lmp, log_return):")
-    print("    lmp range [$9–$475], mean $55.5 — heavy right tail from spike events.")
-    print("    arcsinh_lmp via arcsinh(lmp): handles negative prices, no arbitrary clip.")
-    print("    log_return mean ≈ 0 (martingale property), fat-tailed distribution.")
-    print()
-    print("  Demand proxy (total_mw):")
-    print("    Range [2775–22933 MW], mean 11512 MW. Seasonal and diurnal patterns")
-    print("    expected; adds scale information orthogonal to ILR composition.")
-    print()
-    print("  ILR coordinates (ilr_1 … ilr_7):")
-    print("    All 7 axes in ℝ, unconstrained. ILR1 (Dispatchable vs Variable)")
-    print("    has the widest range, reflecting the variability of renewable")
-    print("    penetration. ILR7 (Solar+ vs Wind−) shows strong diurnal and")
-    print("    seasonal structure, confirmed by the noon summer sign check.")
+    print("  Price features:")
+    print("    lmp, arcsinh_lmp, log_return — raw price dynamics.")
+    print("    log_lmp_shifted, lmp_clipped — log-scale and clipped alternatives.")
+    print("    mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log — MSTL residuals (seasonal removed).")
     print()
     print(feat.describe().round(3).to_string())
 

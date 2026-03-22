@@ -11,7 +11,7 @@ Design
 ------
 Context length (data-driven, confirmed by ACF analysis):
   • Dominant cycles: 24h (daily), 168h (weekly), ~720h (monthly dispatch cycle)
-  • ACF of log_return/log_lmp/total_mw still significant at 720h (0.34–0.45)
+  • ACF of log_return/arcsinh_lmp still significant at 720h (0.34–0.45)
   • Context = 720h: captures ≥4 weekly cycles + 1 monthly dispatch cycle
 
 Sliding windows:
@@ -67,91 +67,36 @@ N_GPUS        = 8                           # max cap — actual actors = min(N_
 BATCH_SIZE    = 32                          # reduced from 256: OOM with larger batches on RTX 3080 Ti (12 GB)
 MAX_RETRIES   = 3                           # Ray actor retries on node failure
 
-FEAT_COLS = [
-    "arcsinh_lmp", "log_return", "total_mw",
-    "ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7",
-]
+# ── Esperimento ──────────────────────────────────────────────────────────────
+# Passa da linea di comando:  python step02_embeddings.py --exp A
+#   A -> log_return          (raw)
+#   B -> arcsinh_lmp         (raw)
+#   C -> mstl_resid_lr       (MSTL residuo di log_return)
+#   D -> mstl_resid_arcsinh  (MSTL residuo di arcsinh_lmp)
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G"])
+EXPERIMENT = _parser.parse_known_args()[0].exp
 
-PLOT_DIR   = Path(C.RESULTS_DIR) / "step02"
+_EXP_MAP = {
+    "A": ["log_return"],           # stationary return (arcsinh diff)
+    "B": ["arcsinh_lmp"],          # price level, negative-safe
+    "C": ["mstl_resid_lr"],        # deseasonalized return
+    "D": ["mstl_resid_arcsinh"],   # deseasonalized level (TOPSIS winner)
+    "E": ["log_lmp_shifted"],      # log-scale level (alt. to arcsinh)
+    "F": ["lmp_clipped"],          # raw level without extreme spikes
+    "G": ["mstl_resid_log"],       # deseasonalized log-level
+}
+FEAT_COLS  = _EXP_MAP[EXPERIMENT]
+EXP_DIR    = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}"
+
+PLOT_DIR   = EXP_DIR / "step02"
 GAP_FROM   = pd.Timestamp("2023-06-14 23:00:00")
 GAP_TO     = pd.Timestamp("2023-06-16 00:00:00")
 
 # TEST_MODE: True  → 50 windows, local CPU (quick sanity check, no Ray needed)
 #            False → all windows, Ray cluster 3×GPU  (production run)
 TEST_MODE  = False   # True = 50 win CPU (debug) | False = Ray cluster 3×GPU (production)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ACF / spectral context-length analysis  (produces 2 figures)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def acf_analysis(out: pd.DataFrame, max_lag: int = 720) -> None:
-    """
-    Compute and plot ACF for key features up to max_lag hours.
-    Confirms that 720h captures the bulk of autocorrelation structure.
-
-    Figures saved:
-      results/step02/01_acf_context_length.png
-      results/step02/02_periodogram.png
-    """
-    from statsmodels.tsa.stattools import acf as _acf
-    from scipy.signal import periodogram
-
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid", font_scale=0.9)
-    plt.rcParams.update({"figure.dpi": 150, "savefig.bbox": "tight",
-                         "savefig.facecolor": "white"})
-
-    features    = ["log_return", "arcsinh_lmp", "total_mw", "ilr_7", "ilr_1"]
-    feat_labels = ["log_return", "arcsinh_lmp", "total_mw",
-                   "ILR7 (Solar/Wind)", "ILR1 (Dispatch)"]
-    colors = plt.cm.tab10(np.linspace(0, 0.9, len(features)))
-    n      = len(out)
-    ci     = 1.96 / np.sqrt(n)
-    lags   = np.arange(0, max_lag + 1)
-
-    fig, axes = plt.subplots(len(features), 1, figsize=(14, 12), sharex=True)
-    for ax, col, label, color in zip(axes, features, feat_labels, colors):
-        a = _acf(out[col].dropna().values, nlags=max_lag, fft=True)
-        ax.bar(lags[1:], a[1:], width=1.0, color=color, alpha=0.6)
-        ax.axhline( ci, color="red", lw=0.8, ls="--", alpha=0.7)
-        ax.axhline(-ci, color="red", lw=0.8, ls="--", alpha=0.7)
-        ax.axhline(  0, color="black", lw=0.5)
-        for lag_h, name in [(24,"24h"),(168,"7d"),(336,"14d"),(504,"21d"),(720,"30d")]:
-            ax.axvline(lag_h, color="gray", lw=0.6, ls=":", alpha=0.8)
-            ax.text(lag_h + 3, 0.85, name, fontsize=6.5, color="gray",
-                    transform=ax.get_xaxis_transform())
-        ax.set_ylabel(f"ACF\n{label}", fontsize=8)
-        ax.set_ylim(-0.3, 1.05)
-    axes[-1].set_xlabel("Lag (hours)")
-    axes[0].set_title(
-        f"Autocorrelation Function — context length selection\n"
-        f"Context = {CONTEXT_LEN}h  (red dashes = 95% CI,  grey verticals = key periods)",
-        fontweight="bold"
-    )
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "01_acf_context_length.png")
-    plt.close(fig)
-    print("  [plot] 01_acf_context_length.png")
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, col in zip(axes, ["arcsinh_lmp", "total_mw", "ilr_7"]):
-        series = out[col].dropna().values
-        freqs, power = periodogram(series, fs=1.0)
-        with np.errstate(divide="ignore"):
-            periods_h = np.where(freqs[1:] > 0, 1.0 / freqs[1:], np.nan)
-        mask = (periods_h >= 2) & (periods_h <= 720)
-        ax.semilogy(periods_h[mask], power[1:][mask], lw=0.8, color="#2c6fad")
-        for t, name in [(24,"24h"),(168,"7d"),(720,"30d")]:
-            ax.axvline(t, color="red", lw=1, ls="--", alpha=0.7)
-            ax.text(t + 2, 0.95, name, fontsize=7, color="red",
-                    transform=ax.get_xaxis_transform())
-        ax.set_title(col);  ax.set_xlabel("Period (hours)");  ax.set_ylabel("Power (log)")
-    fig.suptitle("Periodogram — dominant cycles (red = 24h, 7d, 30d)", fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "02_periodogram.png")
-    plt.close(fig)
-    print("  [plot] 02_periodogram.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -693,21 +638,16 @@ def main() -> pd.DataFrame:
     print(f"  Output  : {C.RESULTS_DIR}/embeddings.parquet")
     print(f"  Plots   : {PLOT_DIR}/")
     print(f"  Model   : {CHRONOS_MODEL}  (multivariate, 120M params)")
-    print(f"  Context : {CONTEXT_LEN}h  (30 days — data-driven via ACF)")
+    print(f"  Context : {CONTEXT_LEN}h  (30 days)")
     print(f"  Stride  : {STRIDE_H}h")
     print(f"  Cluster : ray://datalab-rayclnt.unitus.it:10001  ({N_GPUS}×GPU)")
     print()
-    print("  Context length rationale:")
-    print("    ACF of log_return/log_lmp/total_mw significant at 720h (0.34–0.45).")
-    print("    720h = 30 days captures ≥4 weekly cycles + 1 monthly dispatch cycle.")
-    print("    Chronos-2 normalises internally per window — no external scaling needed.")
     print("  Embedding strategy:")
-    print("    All 11 channels passed as one group → group attention captures")
-    print("    cross-channel dependencies (e.g. LMP vs fuel mix shifts).")
-    print("    Per window: embed(group) → mean-pool patches → concat channels.")
+    print("    1 price channel per experiment (A/B/C/D) → Chronos-2 univariate encoder.")
+    print("    Per window: embed(720 steps) → mean-pool patches → embedding vector.")
     print("─" * 65)
 
-    n_steps = 7
+    n_steps = 6
     def _step(n: int, label: str) -> None:
         print(f"\n  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -724,23 +664,18 @@ def main() -> pd.DataFrame:
     out["datetime"] = pd.to_datetime(out["datetime"])
     _done(1, "Load preprocessed data", f"{len(out):,} righe  ×  {len(FEAT_COLS)} canali")
 
-    # ── 2. ACF / spectral plots ──────────────────────────────────────────────
-    _step(2, "ACF / spectral analysis")
-    acf_analysis(out)
-    _done(2, "ACF / spectral analysis", "→ 01_acf_context_length.png  02_periodogram.png")
-
-    # ── 3. Sliding windows ──────────────────────────────────────────────────
-    _step(3, "Build sliding windows")
+    # ── 2. Sliding windows ──────────────────────────────────────────────────
+    _step(2, "Build sliding windows")
     max_w   = 50 if TEST_MODE else None
     windows, timestamps, n_skipped = build_windows(out, max_windows=max_w)
     N = len(windows)
-    _done(3, "Build sliding windows",
+    _done(2, "Build sliding windows",
           f"{N:,} finestre  |  {n_skipped} skipped  |  shape ({N}, {CONTEXT_LEN}, {len(FEAT_COLS)})")
     print(f"     Range: {pd.Timestamp(timestamps[0]).date()}  →  "
           f"{pd.Timestamp(timestamps[-1]).date()}", flush=True)
 
-    # ── 4. Embeddings ────────────────────────────────────────────────────────
-    _step(4, "Extract Chronos-2 embeddings")
+    # ── 3. Embeddings ────────────────────────────────────────────────────────
+    _step(3, "Extract Chronos-2 embeddings")
     try:
         if TEST_MODE:
             print("  [TEST MODE] Running on CPU — 50 windows only", flush=True)
@@ -756,7 +691,7 @@ def main() -> pd.DataFrame:
         sys.exit(1)
 
     emb_dim = embeddings.shape[1]
-    _done(4, "Extract Chronos-2 embeddings", f"shape ({N}, {emb_dim})")
+    _done(3, "Extract Chronos-2 embeddings", f"shape ({N}, {emb_dim})")
 
     # ── 4b. Embedding sanity checks ──────────────────────────────────────────
     # Fail-fast: NaN/Inf in embeddings propagate silently through PCA and UMAP.
@@ -794,22 +729,20 @@ def main() -> pd.DataFrame:
         print(f"\n  ✓  Embedding sanity: 0 NaN, 0 Inf  "
               f"(emb_dim {emb_dim} not divisible by {len(FEAT_COLS)} — skip per-channel check)")
 
-    # ── 5. Save embeddings ───────────────────────────────────────────────────
-    _step(5, "Save embeddings")
+    # ── 4. Save embeddings ───────────────────────────────────────────────────
+    _step(4, "Save embeddings")
     emb_cols = [f"emb_{i}" for i in range(emb_dim)]
     emb_df   = pd.DataFrame(embeddings, columns=emb_cols)
     emb_df.insert(0, "datetime", pd.to_datetime(timestamps))
-    out_path = Path(C.RESULTS_DIR) / "embeddings.parquet"
+    out_path = EXP_DIR / "embeddings.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     emb_df.to_parquet(out_path, index=False)
-    _done(5, "Save embeddings", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(4, "Save embeddings", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
-    # ── 6. Plots ─────────────────────────────────────────────────────────────
-    # PCA pre-reduction rimossa: cuML UMAP su GPU gestisce 7680D direttamente.
-    # step03 carica embeddings.parquet raw (non embeddings_pca.parquet).
-    _step(6, "Diagnostic plots")
+    # ── 5. Plots ─────────────────────────────────────────────────────────────
+    _step(5, "Diagnostic plots")
     make_plots(emb_df)
-    _done(6, "Diagnostic plots", f"→ {PLOT_DIR}/")
+    _done(5, "Diagnostic plots", f"→ {PLOT_DIR}/")
 
     # ── Report ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
