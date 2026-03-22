@@ -49,6 +49,10 @@ PYTHON      = sys.executable
 ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G"]
 RESULTS_DIR = Path("results")
 
+# Directory del progetto — usata per costruire path assoluti degli script
+# in modo che i task Ray trovino i file indipendentemente dalla working dir
+PROJECT_DIR = Path(__file__).parent.resolve()
+
 # Risorse Ray per task — 8 CPU fisici per nodo/worker
 CPU_PER_EMB   = 8    # core per step02 (embedding) — nodo intero
 GPU_PER_EMB   = 1    # gpu per step02 (0 = cpu-only)
@@ -68,11 +72,17 @@ def _make_ray_run():
 
     @ray.remote
     def ray_run(script: str, args: list[str], label: str) -> tuple[str, bool, float]:
-        """Task Ray: lancia script come subprocess e restituisce (label, ok, sec)."""
-        cmd = [PYTHON, script, *args]
+        """Task Ray: lancia script come subprocess e restituisce (label, ok, sec).
+        sys.executable viene valutato sul nodo worker, non sul client.
+        """
+        import sys as _sys
+        python = _sys.executable
+        cmd = [python, script, *args]
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         t0  = time.time()
-        ret = subprocess.run(cmd, env=env)
+        # cwd = directory dello script per trovare config.py e results/
+        cwd = str(Path(script).parent) if Path(script).is_absolute() else None
+        ret = subprocess.run(cmd, env=env, cwd=cwd)
         return label, ret.returncode == 0, time.time() - t0
 
     return ray_run
@@ -243,15 +253,19 @@ def main() -> None:
     print(f"    step03f (clustering): {min(n_exps, slots_clust)} exp in parallelo"
           f"  ({n_exps} totali -> {-(-n_exps // max(slots_clust,1))} wave)", flush=True)
 
+    def S(name):
+        """Path assoluto di uno script nella directory del progetto."""
+        return str(PROJECT_DIR / name)
+
     # ── 1. Preprocessing (locale) ────────────────────────────────────────────
     _header("[1] Preprocessing")
-    if not run_local("step01_preprocessing.py", label="step01"):
+    if not run_local(S("step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
     # ── 2. Embeddings Chronos-2 (Ray, parallelo per exp) ─────────────────────
     if not args.skip_emb:
         tasks = [
-            ("step02_embeddings.py", ["--exp", exp],
+            (S("step02_embeddings.py"), ["--exp", exp],
              f"emb_{exp}", CPU_PER_EMB, GPU_PER_EMB)
             for exp in exps
         ]
@@ -261,7 +275,7 @@ def main() -> None:
 
     # ── 3. PCA -> UMAP -> GMM (Ray, parallelo per exp) ───────────────────────
     tasks = [
-        ("step03f_pca_umap_gmm.py", ["--exp", exp],
+        (S("step03f_pca_umap_gmm.py"), ["--exp", exp],
          f"clust_{exp}", CPU_PER_CLUST, 0)
         for exp in exps
     ]
@@ -270,28 +284,28 @@ def main() -> None:
     # ── 3b. Sensitivity (Ray, opzionale) ─────────────────────────────────────
     if args.sensitivity:
         tasks_k = [
-            ("step03f_sensitivity_K.py", ["--exp", exp],
+            (S("step03f_sensitivity_K.py"), ["--exp", exp],
              f"sens_K_{exp}", CPU_PER_CLUST, 0)
             for exp in exps
         ]
         tasks_s = [
-            ("step03f_sensitivity_seed.py", ["--exp", exp],
+            (S("step03f_sensitivity_seed.py"), ["--exp", exp],
              f"sens_seed_{exp}", CPU_PER_CLUST, 0)
             for exp in exps
         ]
-        failed += run_parallel_ray(ray_run, tasks_k,    "[3b] Sensitivity-K")
-        failed += run_parallel_ray(ray_run, tasks_s,    "[3b] Sensitivity-seed")
+        failed += run_parallel_ray(ray_run, tasks_k, "[3b] Sensitivity-K")
+        failed += run_parallel_ray(ray_run, tasks_s, "[3b] Sensitivity-seed")
 
     # ── 4. Compare TOPSIS (locale) ───────────────────────────────────────────
     _header("[4] Compare (TOPSIS)")
-    if not run_local("step03_compare.py", label="step03_compare"):
+    if not run_local(S("step03_compare.py"), label="step03_compare"):
         failed.append("step03_compare")
 
     # ── 5. Markov (locale) ───────────────────────────────────────────────────
     markov_exp = args.markov_exp or read_winner()
     _header(f"[5] Markov  exp={markov_exp}")
     if markov_exp:
-        if not run_local("step04_markov.py", "--exp", markov_exp,
+        if not run_local(S("step04_markov.py"), "--exp", markov_exp,
                          label=f"step04_markov exp={markov_exp}"):
             failed.append(f"step04_{markov_exp}")
     else:
