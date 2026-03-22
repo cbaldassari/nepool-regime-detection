@@ -123,27 +123,44 @@ def run_parallel_ray(ray_run, tasks: list[tuple], label: str) -> list[str]:
         remote_fn = ray_run.options(num_cpus=n_cpu, num_gpus=n_gpu)
         fut = remote_fn.remote(script, args, task_label)
         pending[fut] = task_label
-        print(f"  >> sottomesso: {task_label}", flush=True)
+
+    # risorse impegnate da questo batch
+    batch_cpu = sum(t[3] for t in tasks)
+    batch_gpu = sum(t[4] for t in tasks)
+    avail     = ray.available_resources()
+    used_cpu  = ray.cluster_resources().get("CPU", 0) - avail.get("CPU", 0)
+    used_gpu  = ray.cluster_resources().get("GPU", 0) - avail.get("GPU", 0)
+    print(f"  {len(tasks)} task sottomessi  |  "
+          f"richiesti CPU={batch_cpu}  GPU={batch_gpu}", flush=True)
+    print(f"  Cluster in uso: CPU={used_cpu:.0f}/{ray.cluster_resources().get('CPU',0):.0f}"
+          f"  GPU={used_gpu:.0f}/{ray.cluster_resources().get('GPU',0):.0f}",
+          flush=True)
 
     # attendi con barra di progresso
     print(flush=True)
-    done   = 0
-    failed = []
+    t_batch   = time.time()
+    done      = 0
+    failed    = []
     remaining = list(pending.keys())
 
     while remaining:
-        # ray.wait restituisce appena almeno 1 task e' pronto
         ready, remaining = ray.wait(remaining, num_returns=1, timeout=None)
         for fut in ready:
             lbl, ok, elapsed = ray.get(fut)
             done += 1
-            status = "OK  " if ok else "FAIL"
+            avail    = ray.available_resources()
+            used_cpu = ray.cluster_resources().get("CPU", 0) - avail.get("CPU", 0)
+            used_gpu = ray.cluster_resources().get("GPU", 0) - avail.get("GPU", 0)
+            status   = "OK  " if ok else "FAIL"
             print(f"  [{status}] {lbl}  ({elapsed:.1f}s)  "
-                  f"{_progress_bar(done, n)}", flush=True)
+                  f"{_progress_bar(done, n)}  "
+                  f"cluster CPU={used_cpu:.0f}  GPU={used_gpu:.0f}",
+                  flush=True)
             if not ok:
                 failed.append(lbl)
 
-    print(f"\n  Completati: {done}/{n}  "
+    batch_elapsed = time.time() - t_batch
+    print(f"\n  Completati: {done}/{n}  batch={batch_elapsed:.1f}s  "
           f"({'tutti OK' if not failed else f'{len(failed)} falliti'})",
           flush=True)
     return failed
@@ -204,6 +221,27 @@ def main() -> None:
     )
 
     ray_run = _make_ray_run()
+
+    # ── Info cluster ─────────────────────────────────────────────────────────
+    nodes = ray.nodes()
+    alive = [n for n in nodes if n.get("Alive")]
+    print(f"\n  Nodi attivi    : {len(alive)}/{len(nodes)}", flush=True)
+    for i, n in enumerate(alive):
+        res = n.get("Resources", {})
+        print(f"    nodo {i+1}  CPU={res.get('CPU', 0):.0f}"
+              f"  GPU={res.get('GPU', 0):.0f}"
+              f"  RAM={res.get('memory', 0)/1e9:.1f}GB"
+              f"  [{n.get('NodeManagerAddress', '?')}]", flush=True)
+    total_cpu = resources.get("CPU", 0)
+    total_gpu = resources.get("GPU", 0)
+    n_exps    = len(exps)
+    slots_emb   = int(total_gpu) if total_gpu > 0 else int(total_cpu // CPU_PER_EMB)
+    slots_clust = int(total_cpu // CPU_PER_CLUST)
+    print(f"\n  Parallelismo stimato:", flush=True)
+    print(f"    step02 (embedding) : {min(n_exps, slots_emb)} exp in parallelo"
+          f"  ({n_exps} totali -> {-(-n_exps // max(slots_emb,1))} wave)", flush=True)
+    print(f"    step03f (clustering): {min(n_exps, slots_clust)} exp in parallelo"
+          f"  ({n_exps} totali -> {-(-n_exps // max(slots_clust,1))} wave)", flush=True)
 
     # ── 1. Preprocessing (locale) ────────────────────────────────────────────
     _header("[1] Preprocessing")
