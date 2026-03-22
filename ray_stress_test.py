@@ -128,13 +128,22 @@ def main():
     parser = argparse.ArgumentParser(description="Ray CPU+GPU stress test")
     parser.add_argument("--tasks",    type=int,  default=3)
     parser.add_argument("--duration", type=int,  default=30)
-    parser.add_argument("--cpus",     type=int,  default=8)
+    parser.add_argument("--cpus",     type=int,  default=None,
+                        help="Core per task CPU (default: 7 se GPU attiva, 8 se cpu-only)")
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--gpu-only", action="store_true")
     args = parser.parse_args()
 
     run_cpu = not args.gpu_only
     run_gpu = not args.cpu_only
+
+    # se CPU e GPU girano insieme, cede 1 core al task GPU per nodo
+    if args.cpus is not None:
+        n_cpu = args.cpus
+    elif run_cpu and run_gpu:
+        n_cpu = 7   # 7 CPU task + 1 CPU per GPU task = 8 totali per nodo
+    else:
+        n_cpu = 8
 
     print(f"\nConnessione a {RAY_ADDRESS}...")
     _init_ray()
@@ -151,16 +160,23 @@ def main():
     futures = []
     n_tasks = 0
 
+    if run_cpu and run_gpu:
+        print(f"\nLancio {args.tasks} task CPU + {args.tasks} task GPU in contemporanea")
+        print(f"  CPU: {n_cpu} core/task  |  GPU: 1 GPU + 1 core/task")
+        print(f"  Layout per nodo: {n_cpu} CPU (stress) + 1 CPU + 1 GPU (stress) = {n_cpu+1} CPU totali")
+    elif run_cpu:
+        print(f"\nLancio {args.tasks} task CPU ({args.duration}s, {n_cpu} core)")
+    else:
+        print(f"\nLancio {args.tasks} task GPU ({args.duration}s, 1 GPU)")
+
     if run_cpu:
-        print(f"\nLancio {args.tasks} task CPU ({args.duration}s, {args.cpus} core)...")
         for i in range(args.tasks):
             futures.append(
-                cpu_stress.options(num_cpus=args.cpus).remote(i, args.duration, args.cpus)
+                cpu_stress.options(num_cpus=n_cpu).remote(i, args.duration, n_cpu)
             )
             n_tasks += 1
 
     if run_gpu:
-        print(f"Lancio {args.tasks} task GPU ({args.duration}s, 1 GPU)...")
         for i in range(args.tasks):
             futures.append(
                 gpu_stress.options(num_cpus=1, num_gpus=1).remote(i, args.duration)
