@@ -195,7 +195,7 @@ def main() -> None:
     parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--markov-exp",  default=None, metavar="EXP")
     parser.add_argument(
-        "--ray-address", default="ray://datalab-rayclnt.unitus.it:10001",
+        "--ray-address", default="ray://10.4.4.7:10001",
         metavar="ADDR",
         help="Indirizzo Ray (default: cluster Unitus)",
     )
