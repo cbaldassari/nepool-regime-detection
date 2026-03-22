@@ -164,7 +164,12 @@ def main() -> None:
 
     # ── Init Ray ─────────────────────────────────────────────────────────────
     import ray
-    ray.init(address=args.ray_address, ignore_reinit_error=True)
+    try:
+        ray.init(address=args.ray_address, ignore_reinit_error=True)
+    except ConnectionError:
+        print("  Ray cluster non trovato — avvio Ray in modalita' locale",
+              flush=True)
+        ray.init(ignore_reinit_error=True)
     resources = ray.cluster_resources()
     _header(
         f"NEPOOL Regime Detection — Ray Pipeline\n"
