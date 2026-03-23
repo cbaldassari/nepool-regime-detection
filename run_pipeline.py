@@ -43,14 +43,19 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-PYTHON      = sys.executable
+PYTHON       = sys.executable
+NTFY_TOPIC   = "cbal"          # ntfy.sh topic — iscriviti sull'app/browser
+NTFY_URL     = f"https://ntfy.sh/{NTFY_TOPIC}"
+HB_INTERVAL  = 180             # secondi tra un heartbeat e l'altro (3 min)
 ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I",
                "J", "K", "L",   # ILR raw ablation
                "M", "N", "O"]   # ILR detrended ablation
@@ -67,18 +72,45 @@ def S(name: str) -> str:
     return str(PROJECT_DIR / name)
 
 
+def notify(msg: str, title: str = "NEPOOL pipeline") -> None:
+    """Invia notifica a ntfy.sh (silenzioso se offline)."""
+    try:
+        req = urllib.request.Request(
+            NTFY_URL,
+            data=msg.encode(),
+            headers={"Title": title, "Priority": "default"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
 def run_local(script: str, *args: str, label: str = "") -> bool:
-    """Esegue uno script come subprocess e stampa stato + tempo."""
+    """Esegue uno script come subprocess.
+    Ogni HB_INTERVAL secondi manda una notifica ntfy con stato corrente.
+    """
     cmd = [PYTHON, script, *args]
     tag = label or Path(script).name
     bar = "-" * 65
     print(f"\n{bar}\n  >> {tag}\n{bar}", flush=True)
-    t0  = time.time()
+    t0   = time.time()
+    stop = threading.Event()
+
+    def _heartbeat():
+        while not stop.wait(HB_INTERVAL):
+            mins = (time.time() - t0) / 60
+            notify(f"In corso: {tag}\nElapsed: {mins:.0f} min")
+
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     ret = subprocess.run(cmd, env=env, cwd=str(PROJECT_DIR))
+    stop.set()
     elapsed = time.time() - t0
     status  = "OK  " if ret.returncode == 0 else "FAIL"
     print(f"  [{status}] {tag}  ({elapsed:.1f}s)", flush=True)
+    notify(f"[{status.strip()}] {tag}\n{elapsed/60:.1f} min",
+           title="NEPOOL OK" if status.startswith("OK") else "NEPOOL FAIL")
     return ret.returncode == 0
 
 
@@ -153,6 +185,7 @@ def main() -> None:
         f"  Esperimenti : {exps}\n"
         f"  Python      : {PYTHON}"
     )
+    notify(f"Pipeline avviata\nExp: {exps}", title="NEPOOL start")
 
     # ── 1. Preprocessing ─────────────────────────────────────────────────────
     _header("[1] Preprocessing")
@@ -250,8 +283,12 @@ def main() -> None:
     print(f"  Tempo totale : {elapsed / 60:.1f} min", flush=True)
     if failed:
         print(f"  FALLITI ({len(failed)}) : {failed}", flush=True)
+        notify(f"Pipeline FALLITA\n{len(failed)} step falliti: {failed}\n{elapsed/60:.0f} min totali",
+               title="NEPOOL FAIL")
     else:
         print("  Tutti gli step completati con successo.", flush=True)
+        notify(f"Pipeline completata con successo!\n{elapsed/60:.0f} min totali",
+               title="NEPOOL DONE")
 
 
 if __name__ == "__main__":
