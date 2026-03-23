@@ -61,7 +61,7 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as C
 
 PLOT_DIR = Path(C.RESULTS_DIR) / "step01"
@@ -102,12 +102,26 @@ def build_price_features(df: pd.DataFrame) -> pd.DataFrame:
     p1, p99   = np.percentile(lmp, 1), np.percentile(lmp, 99)
     lmp_clipped = np.clip(lmp, p1, p99)
 
+    # quantile_transform: mappa LMP a distribuzione normale via ranghi
+    # distribution-free, non richiede soglia arbitraria
+    from sklearn.preprocessing import QuantileTransformer
+    qt = QuantileTransformer(output_distribution="normal", random_state=42)
+    quantile_transform = qt.fit_transform(lmp.reshape(-1, 1)).ravel()
+
+    # rolling_zscore_24h: (LMP - media_24h) / std_24h — normalizzazione adattiva locale
+    s = pd.Series(lmp)
+    r_mean = s.rolling(24, min_periods=2).mean()
+    r_std  = s.rolling(24, min_periods=2).std().clip(lower=1e-8)
+    rolling_zscore_24h = ((s - r_mean) / r_std).values
+
     return pd.DataFrame({
-        "lmp"            : lmp,
-        "arcsinh_lmp"    : arcsinh_lmp,
-        "log_return"     : log_ret,
-        "log_lmp_shifted": log_lmp_shifted,
-        "lmp_clipped"    : lmp_clipped,
+        "lmp"               : lmp,
+        "arcsinh_lmp"       : arcsinh_lmp,
+        "log_return"        : log_ret,
+        "log_lmp_shifted"   : log_lmp_shifted,
+        "lmp_clipped"       : lmp_clipped,
+        "quantile_transform": quantile_transform,
+        "rolling_zscore_24h": rolling_zscore_24h,
     }, index=df.index)
 
 

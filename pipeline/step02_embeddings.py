@@ -53,7 +53,7 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as C
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,17 +75,19 @@ MAX_RETRIES   = 3                           # Ray actor retries on node failure
 #   D -> mstl_resid_arcsinh  (MSTL residuo di arcsinh_lmp)
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G"])
+_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G","H","I"])
 EXPERIMENT = _parser.parse_known_args()[0].exp
 
 _EXP_MAP = {
-    "A": ["log_return"],           # stationary return (arcsinh diff)
-    "B": ["arcsinh_lmp"],          # price level, negative-safe
-    "C": ["mstl_resid_lr"],        # deseasonalized return
-    "D": ["mstl_resid_arcsinh"],   # deseasonalized level (TOPSIS winner)
-    "E": ["log_lmp_shifted"],      # log-scale level (alt. to arcsinh)
-    "F": ["lmp_clipped"],          # raw level without extreme spikes
-    "G": ["mstl_resid_log"],       # deseasonalized log-level
+    "A": ["log_return"],            # stationary return (arcsinh diff)
+    "B": ["arcsinh_lmp"],           # price level, negative-safe
+    "C": ["mstl_resid_lr"],         # deseasonalized return
+    "D": ["mstl_resid_arcsinh"],    # deseasonalized level (TOPSIS winner)
+    "E": ["log_lmp_shifted"],       # log-scale level (alt. to arcsinh)
+    "F": ["lmp_clipped"],           # raw level without extreme spikes
+    "G": ["mstl_resid_log"],        # deseasonalized log-level
+    "H": ["quantile_transform"],    # distribution-free normal mapping
+    "I": ["rolling_zscore_24h"],    # adaptive local normalization
 }
 FEAT_COLS  = _EXP_MAP[EXPERIMENT]
 EXP_DIR    = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}"

@@ -297,8 +297,8 @@ def plot_labels_heatmap(timestamps, labels_dict):
     ks = sorted(labels_dict.keys())
 
     # Aggrega per mese per leggibilità (altrimenti 6945 righe)
-    ts    = pd.to_datetime(timestamps)
-    months = ts.to_period("M").astype(str)
+    ts    = pd.to_datetime(timestamps).reset_index(drop=True)
+    months = ts.dt.to_period("M").astype(str)
     unique_months = sorted(months.unique())
 
     # Matrice: righe = mesi, colonne = K

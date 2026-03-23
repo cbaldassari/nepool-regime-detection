@@ -17,7 +17,7 @@ come task Ray e girano in parallelo sui nodi disponibili del cluster.
 
 Risorse per task
 ----------------
-  step02  : CPU_PER_EMB cpu + GPU_PER_EMB gpu  (default: 4 cpu, 1 gpu)
+  step02  : CPU_PER_EMB cpu + GPU_PER_EMB gpu  (default: 8 cpu, 1 gpu)
   step03f : CPU_PER_CLUST cpu                  (default: 8 cpu, 0 gpu)
   Modifica le costanti qui sotto per adattarle al tuo cluster.
 
@@ -46,7 +46,7 @@ from pathlib import Path
 # =============================================================================
 
 PYTHON      = sys.executable
-ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G"]
+ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
 RESULTS_DIR = Path("results")
 
 # Directory del progetto — usata per costruire path assoluti degli script
@@ -80,7 +80,6 @@ def _make_ray_run():
         cmd = [python, script, *args]
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         t0  = time.time()
-        # cwd = directory dello script per trovare config.py e results/
         cwd = str(Path(script).parent) if Path(script).is_absolute() else None
         ret = subprocess.run(cmd, env=env, cwd=cwd)
         return label, ret.returncode == 0, time.time() - t0
@@ -205,14 +204,18 @@ def main() -> None:
     parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--markov-exp",  default=None, metavar="EXP")
     parser.add_argument(
-        "--ray-address", default="ray://10.4.4.7:10001",
+        "--ray-address", default="auto",
         metavar="ADDR",
-        help="Indirizzo Ray (default: cluster Unitus)",
+        help="Indirizzo Ray (default: auto — da head node; usa ray://10.4.4.7:10001 da Windows)",
     )
     args    = parser.parse_args()
     exps    = args.exp
     t_start = time.time()
     failed  = []
+
+    def S(name):
+        """Path assoluto di uno script nella directory del progetto."""
+        return str(PROJECT_DIR / name)
 
     # ── Init Ray ─────────────────────────────────────────────────────────────
     import ray
@@ -253,19 +256,15 @@ def main() -> None:
     print(f"    step03f (clustering): {min(n_exps, slots_clust)} exp in parallelo"
           f"  ({n_exps} totali -> {-(-n_exps // max(slots_clust,1))} wave)", flush=True)
 
-    def S(name):
-        """Path assoluto di uno script nella directory del progetto."""
-        return str(PROJECT_DIR / name)
-
     # ── 1. Preprocessing (locale) ────────────────────────────────────────────
     _header("[1] Preprocessing")
-    if not run_local(S("step01_preprocessing.py"), label="step01"):
+    if not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
     # ── 2. Embeddings Chronos-2 (Ray, parallelo per exp) ─────────────────────
     if not args.skip_emb:
         tasks = [
-            (S("step02_embeddings.py"), ["--exp", exp],
+            (S("pipeline/step02_embeddings.py"), ["--exp", exp],
              f"emb_{exp}", CPU_PER_EMB, GPU_PER_EMB)
             for exp in exps
         ]
@@ -275,7 +274,7 @@ def main() -> None:
 
     # ── 3. PCA -> UMAP -> GMM (Ray, parallelo per exp) ───────────────────────
     tasks = [
-        (S("step03f_pca_umap_gmm.py"), ["--exp", exp],
+        (S("pipeline/step03_pca_umap_gmm.py"), ["--exp", exp],
          f"clust_{exp}", CPU_PER_CLUST, 0)
         for exp in exps
     ]
@@ -284,12 +283,12 @@ def main() -> None:
     # ── 3b. Sensitivity (Ray, opzionale) ─────────────────────────────────────
     if args.sensitivity:
         tasks_k = [
-            (S("step03f_sensitivity_K.py"), ["--exp", exp],
+            (S("sensitivity/sensitivity_K.py"), ["--exp", exp],
              f"sens_K_{exp}", CPU_PER_CLUST, 0)
             for exp in exps
         ]
         tasks_s = [
-            (S("step03f_sensitivity_seed.py"), ["--exp", exp],
+            (S("sensitivity/sensitivity_seed.py"), ["--exp", exp],
              f"sens_seed_{exp}", CPU_PER_CLUST, 0)
             for exp in exps
         ]
@@ -298,14 +297,14 @@ def main() -> None:
 
     # ── 4. Compare TOPSIS (locale) ───────────────────────────────────────────
     _header("[4] Compare (TOPSIS)")
-    if not run_local(S("step03_compare.py"), label="step03_compare"):
+    if not run_local(S("pipeline/step03_compare.py"), label="step03_compare"):
         failed.append("step03_compare")
 
     # ── 5. Markov (locale) ───────────────────────────────────────────────────
     markov_exp = args.markov_exp or read_winner()
     _header(f"[5] Markov  exp={markov_exp}")
     if markov_exp:
-        if not run_local(S("step04_markov.py"), "--exp", markov_exp,
+        if not run_local(S("pipeline/step04_markov.py"), "--exp", markov_exp,
                          label=f"step04_markov exp={markov_exp}"):
             failed.append(f"step04_{markov_exp}")
     else:
