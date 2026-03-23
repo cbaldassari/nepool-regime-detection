@@ -1,32 +1,28 @@
 """
 run_pipeline.py
 ===============
-Launcher della pipeline NEPOOL Regime Detection su cluster Ray.
+Launcher della pipeline NEPOOL Regime Detection in locale.
 
 Struttura
 ---------
-  [1]   Preprocessing      locale   — step01_preprocessing.py
-  [2b]  Baseline features  locale   — baseline_features.py + baseline_stats_gmm.py
-                                       (opzionale, --baselines; solo preprocessed.parquet)
-  [2]   Embeddings         Ray/GPU  — step02_embeddings.py  (per exp, parallelo)
-  [3]   PCA+UMAP+GMM       Ray/CPU  — step03_pca_umap_gmm.py (per exp, parallelo)
-  [3b]  Sensitivity        Ray/CPU  — sensitivity_K.py + sensitivity_seed.py
-                                       (opzionale, --sensitivity; per exp, parallelo)
-  [4]   Compare TOPSIS     locale   — step03_compare.py → winner.json
-  [3c]  Alt clustering     locale   — clustering_dendrogram.py + clustering_hdbscan.py
-                                       (opzionale, --baselines; sul vincitore)
-  [5]   Markov             locale   — step04_markov.py (sul vincitore)
+  [1]   Preprocessing      — step01_preprocessing.py
+  [2b]  Baseline features  — baseline_features.py + baseline_stats_gmm.py
+                               (opzionale, --baselines)
+  [2]   Embeddings         — step02_embeddings.py  (per exp, sequenziale)
+  [3]   PCA+UMAP+GMM       — step03_pca_umap_gmm.py (per exp, sequenziale)
+  [3b]  Sensitivity        — sensitivity_K.py + sensitivity_seed.py
+                               (opzionale, --sensitivity; per exp)
+  [4]   Compare TOPSIS     — step03_compare.py → winner.json
+  [3c]  Alt clustering     — clustering_dendrogram.py
+                               (opzionale, --baselines; sul vincitore)
+  [3d]  Diagnostics        — step03_interpretation.py + altri
+                               (opzionale, --diagnostics; sul vincitore)
+  [5]   Markov             — step04_markov.py (sul vincitore)
 
 Esperimenti A-O:
   A-I  : price-only (diverse trasformazioni)
   J-L  : ILR raw (fuel-mix isometric log-ratio)
   M-O  : ILR detrended (MSTL residui ILR)
-
-Risorse per task
-----------------
-  step02  : CPU_PER_EMB cpu + GPU_PER_EMB gpu  (default: 8 cpu, 1 gpu)
-  step03  : CPU_PER_CLUST cpu                  (default: 8 cpu, 0 gpu)
-  Modifica le costanti qui sotto per adattarle al tuo cluster.
 
 Uso
 ---
@@ -35,11 +31,9 @@ Uso
   python run_pipeline.py --skip-preproc         # salta step01 (già fatto)
   python run_pipeline.py --skip-emb             # salta step02
   python run_pipeline.py --sensitivity          # aggiunge [3b] sensitivity K/seed
-  python run_pipeline.py --baselines            # aggiunge [2b] feature baseline e [3c] alt clustering
+  python run_pipeline.py --baselines            # aggiunge [2b] baseline e [3c] dendrogram
   python run_pipeline.py --diagnostics          # aggiunge [3d] diagnostics sul vincitore
-  python run_pipeline.py --markov-exp D         # forza esperimento per Markov/alt-clustering/diagnostics
-  python run_pipeline.py --ray-address auto     # connetti a cluster Ray esterno
-  python run_pipeline.py --cluster-dir /data/nepool-regime-detection  # path progetto sui nodi Linux
+  python run_pipeline.py --markov-exp D         # forza exp per Markov/alt-clustering/diagnostics
 """
 
 from __future__ import annotations
@@ -61,128 +55,51 @@ ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I",
                "J", "K", "L",   # ILR raw ablation
                "M", "N", "O"]   # ILR detrended ablation
 RESULTS_DIR = Path("results")
-
-# Directory del progetto — usata per costruire path assoluti degli script
-# in modo che i task Ray trovino i file indipendentemente dalla working dir
 PROJECT_DIR = Path(__file__).parent.resolve()
-
-# Risorse Ray per task — 8 CPU fisici per nodo/worker
-CPU_PER_EMB   = 8    # core per step02 (embedding) — nodo intero
-GPU_PER_EMB   = 1    # gpu per step02 (0 = cpu-only)
-CPU_PER_CLUST = 8    # core per step03f (clustering) — nodo intero
-
-
-# =============================================================================
-# RAY TASK
-# =============================================================================
-
-def _make_ray_run():
-    """
-    Definisce il task Ray a runtime (dopo ray.init) per evitare
-    import di ray al top-level prima dell'inizializzazione.
-    """
-    import ray
-
-    @ray.remote
-    def ray_run(script: str, args: list[str], label: str) -> tuple[str, bool, float]:
-        """Task Ray: lancia script come subprocess e restituisce (label, ok, sec).
-        sys.executable viene valutato sul nodo worker, non sul client.
-        """
-        import sys as _sys
-        python = _sys.executable
-        cmd = [python, script, *args]
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        t0  = time.time()
-        cwd = str(Path(script).parent) if Path(script).is_absolute() else None
-        ret = subprocess.run(cmd, env=env, cwd=cwd)
-        return label, ret.returncode == 0, time.time() - t0
-
-    return ray_run
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
+def S(name: str) -> str:
+    """Path assoluto di uno script nella directory del progetto."""
+    return str(PROJECT_DIR / name)
+
+
 def run_local(script: str, *args: str, label: str = "") -> bool:
-    """Esegue script localmente (step1, step4, step5)."""
+    """Esegue uno script come subprocess e stampa stato + tempo."""
     cmd = [PYTHON, script, *args]
-    tag = label or script
+    tag = label or Path(script).name
     bar = "-" * 65
     print(f"\n{bar}\n  >> {tag}\n{bar}", flush=True)
     t0  = time.time()
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    ret = subprocess.run(cmd, env=env)
+    ret = subprocess.run(cmd, env=env, cwd=str(PROJECT_DIR))
     elapsed = time.time() - t0
     status  = "OK  " if ret.returncode == 0 else "FAIL"
     print(f"  [{status}] {tag}  ({elapsed:.1f}s)", flush=True)
     return ret.returncode == 0
 
 
-def _progress_bar(done: int, total: int, width: int = 30) -> str:
-    filled = int(width * done / max(total, 1))
-    bar    = "#" * filled + "-" * (width - filled)
-    return f"[{bar}] {done}/{total}"
-
-
-def run_parallel_ray(ray_run, tasks: list[tuple], label: str) -> list[str]:
+def run_sequence(tasks: list[tuple], label: str) -> list[str]:
     """
-    Sottomette una lista di task Ray e aspetta il completamento.
-    Mostra una barra di progresso man mano che i task terminano.
-
-    tasks: lista di (script, args_list, task_label, num_cpus, num_gpus)
+    Esegue una lista di task sequenzialmente.
+    tasks: lista di (script, args_list, task_label)
     Restituisce lista di label falliti.
     """
-    import ray
-
     bar = "=" * 65
     n   = len(tasks)
-    print(f"\n{bar}\n  {label}  ({n} task Ray)\n{bar}", flush=True)
-
-    # sottometti tutti i task
-    pending = {}   # future -> task_label
-    for script, args, task_label, n_cpu, n_gpu in tasks:
-        remote_fn = ray_run.options(num_cpus=n_cpu, num_gpus=n_gpu)
-        fut = remote_fn.remote(script, args, task_label)
-        pending[fut] = task_label
-
-    # risorse impegnate da questo batch
-    batch_cpu = sum(t[3] for t in tasks)
-    batch_gpu = sum(t[4] for t in tasks)
-    avail     = ray.available_resources()
-    used_cpu  = ray.cluster_resources().get("CPU", 0) - avail.get("CPU", 0)
-    used_gpu  = ray.cluster_resources().get("GPU", 0) - avail.get("GPU", 0)
-    print(f"  {len(tasks)} task sottomessi  |  "
-          f"richiesti CPU={batch_cpu}  GPU={batch_gpu}", flush=True)
-    print(f"  Cluster in uso: CPU={used_cpu:.0f}/{ray.cluster_resources().get('CPU',0):.0f}"
-          f"  GPU={used_gpu:.0f}/{ray.cluster_resources().get('GPU',0):.0f}",
-          flush=True)
-
-    # attendi con barra di progresso
-    print(flush=True)
-    t_batch   = time.time()
-    done      = 0
-    failed    = []
-    remaining = list(pending.keys())
-
-    while remaining:
-        ready, remaining = ray.wait(remaining, num_returns=1, timeout=None)
-        for fut in ready:
-            lbl, ok, elapsed = ray.get(fut)
-            done += 1
-            avail    = ray.available_resources()
-            used_cpu = ray.cluster_resources().get("CPU", 0) - avail.get("CPU", 0)
-            used_gpu = ray.cluster_resources().get("GPU", 0) - avail.get("GPU", 0)
-            status   = "OK  " if ok else "FAIL"
-            print(f"  [{status}] {lbl}  ({elapsed:.1f}s)  "
-                  f"{_progress_bar(done, n)}  "
-                  f"cluster CPU={used_cpu:.0f}  GPU={used_gpu:.0f}",
-                  flush=True)
-            if not ok:
-                failed.append(lbl)
-
-    batch_elapsed = time.time() - t_batch
-    print(f"\n  Completati: {done}/{n}  batch={batch_elapsed:.1f}s  "
+    print(f"\n{bar}\n  {label}  ({n} task)\n{bar}", flush=True)
+    failed = []
+    t_start = time.time()
+    for i, (script, args, task_label) in enumerate(tasks, 1):
+        print(f"\n  [{i}/{n}] {task_label}", flush=True)
+        ok = run_local(script, *args, label=task_label)
+        if not ok:
+            failed.append(task_label)
+    elapsed = time.time() - t_start
+    print(f"\n  Completati: {n - len(failed)}/{n}  totale={elapsed:.1f}s  "
           f"({'tutti OK' if not failed else f'{len(failed)} falliti'})",
           flush=True)
     return failed
@@ -207,231 +124,125 @@ def _header(msg: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Pipeline NEPOOL su cluster Ray",
+        description="Pipeline NEPOOL in locale",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "--exp", nargs="+", default=ALL_EXPS,
-        choices=ALL_EXPS, metavar="EXP",  # A-I: price only; J-L: ILR ablation
+        choices=ALL_EXPS, metavar="EXP",
     )
-    parser.add_argument("--probe", action="store_true",
-                        help="Esegue un task Ray su ogni nodo e stampa home dir + cerca il progetto")
     parser.add_argument("--skip-preproc", action="store_true",
                         help="Salta step01 (preprocessing già fatto)")
-    parser.add_argument("--skip-emb",    action="store_true")
-    parser.add_argument("--sensitivity", action="store_true",
+    parser.add_argument("--skip-emb",     action="store_true",
+                        help="Salta step02 (embeddings già calcolati)")
+    parser.add_argument("--sensitivity",  action="store_true",
                         help="Aggiunge [3b] sensitivity-K e sensitivity-seed per ogni exp")
-    parser.add_argument("--baselines",   action="store_true",
-                        help="Aggiunge [2b] baseline features e [3c] clustering alternativi sul vincitore")
-    parser.add_argument("--diagnostics", action="store_true",
-                        help="Aggiunge [3d] diagnostics sul vincitore (MI, persistence, interpretation, validation, justification)")
-    parser.add_argument("--markov-exp",  default=None, metavar="EXP")
-    parser.add_argument(
-        "--cluster-dir", default=None, metavar="PATH",
-        help="Path del progetto SUI NODI del cluster (Linux). Necessario quando si lancia\n"
-             "da client Windows. Es: /home/ubuntu/nepool-regime-detection\n"
-             "Se omesso usa lo stesso path di questo script.",
-    )
-    parser.add_argument(
-        "--ray-address", default="ray://10.4.4.7:10001",
-        metavar="ADDR",
-        help="Indirizzo Ray (default: ray://10.4.4.7:10001; usa auto da head node)",
-    )
+    parser.add_argument("--baselines",    action="store_true",
+                        help="Aggiunge [2b] baseline features e [3c] dendrogram sul vincitore")
+    parser.add_argument("--diagnostics",  action="store_true",
+                        help="Aggiunge [3d] diagnostics sul vincitore")
+    parser.add_argument("--markov-exp",   default=None, metavar="EXP",
+                        help="Forza exp per Markov/alt-clustering/diagnostics (ignora winner.json)")
     args    = parser.parse_args()
     exps    = args.exp
     t_start = time.time()
     failed  = []
 
-    # Radice del progetto sui nodi cluster (Linux) — può differire dal client Windows.
-    # Su nodi Linux i path backslash non funzionano, quindi usiamo posixpath.
-    _cluster_root = args.cluster_dir or str(PROJECT_DIR)
-
-    def S(name):
-        """Path assoluto di uno script: usa cluster_dir sui nodi Ray, PROJECT_DIR in locale."""
-        return _cluster_root.rstrip("/\\") + "/" + name
-
-    # ── Init Ray ─────────────────────────────────────────────────────────────
-    import ray
-    try:
-        ray.init(address=args.ray_address, ignore_reinit_error=True)
-    except ConnectionError:
-        print("  Ray cluster non trovato — avvio Ray in modalita' locale",
-              flush=True)
-        ray.init(ignore_reinit_error=True)
-    resources = ray.cluster_resources()
     _header(
-        f"NEPOOL Regime Detection — Ray Pipeline\n"
+        f"NEPOOL Regime Detection — Pipeline locale\n"
         f"  Esperimenti : {exps}\n"
-        f"  Ray cluster : CPU={resources.get('CPU', '?'):.0f}"
-        f"  GPU={resources.get('GPU', 0):.0f}\n"
-        f"  Script dir  : {_cluster_root}"
+        f"  Python      : {PYTHON}"
     )
 
-    ray_run = _make_ray_run()
-
-    # ── Probe (opzionale) ─────────────────────────────────────────────────────
-    if args.probe:
-        import ray as _ray
-
-        @_ray.remote
-        def _probe_node():
-            import os, socket, subprocess
-            hostname = socket.gethostname()
-            home     = os.path.expanduser("~")
-            # cerca run_pipeline.py nelle dir più comuni
-            search   = subprocess.run(
-                ["find", "/", "-name", "run_pipeline.py", "-maxdepth", "8",
-                 "!", "-path", "*/proc/*", "!", "-path", "*/sys/*"],
-                capture_output=True, text=True, timeout=20,
-            )
-            found = [l.strip() for l in search.stdout.splitlines() if l.strip()]
-            return hostname, home, found
-
-        print("\n  Probe in corso su 3 nodi...", flush=True)
-        futs = [_probe_node.remote() for _ in range(3)]
-        for hostname, home, found in _ray.get(futs):
-            print(f"\n  [{hostname}]  home={home}", flush=True)
-            if found:
-                for p in found:
-                    print(f"    run_pipeline.py trovato → {p}", flush=True)
-                    print(f"    → --cluster-dir {os.path.dirname(p)}", flush=True)
-            else:
-                print("    run_pipeline.py NON trovato sul nodo", flush=True)
-        ray.shutdown()
-        return
-
-    # ── Info cluster ─────────────────────────────────────────────────────────
-    nodes = ray.nodes()
-    alive = [n for n in nodes if n.get("Alive")]
-    print(f"\n  Nodi attivi    : {len(alive)}/{len(nodes)}", flush=True)
-    for i, n in enumerate(alive):
-        res = n.get("Resources", {})
-        print(f"    nodo {i+1}  CPU={res.get('CPU', 0):.0f}"
-              f"  GPU={res.get('GPU', 0):.0f}"
-              f"  RAM={res.get('memory', 0)/1e9:.1f}GB"
-              f"  [{n.get('NodeManagerAddress', '?')}]", flush=True)
-    total_cpu = resources.get("CPU", 0)
-    total_gpu = resources.get("GPU", 0)
-    n_exps    = len(exps)
-    slots_emb   = int(total_gpu) if total_gpu > 0 else int(total_cpu // CPU_PER_EMB)
-    slots_clust = int(total_cpu // CPU_PER_CLUST)
-    print(f"\n  Parallelismo stimato:", flush=True)
-    print(f"    step02 (embedding) : {min(n_exps, slots_emb)} exp in parallelo"
-          f"  ({n_exps} totali -> {-(-n_exps // max(slots_emb,1))} wave)", flush=True)
-    print(f"    step03f (clustering): {min(n_exps, slots_clust)} exp in parallelo"
-          f"  ({n_exps} totali -> {-(-n_exps // max(slots_clust,1))} wave)", flush=True)
-
-    # ── 1. Preprocessing (locale) ────────────────────────────────────────────
+    # ── 1. Preprocessing ─────────────────────────────────────────────────────
     _header("[1] Preprocessing")
     if args.skip_preproc:
         print("  SALTATO (--skip-preproc)", flush=True)
     elif not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
-    # ── 2b. Baseline features (Ray, opzionale) ───────────────────────────────
-    # baseline_features: PCA+UMAP+GMM su feature manuali (~10-20 min) → Ray CPU task.
-    # baseline_stats_gmm: GMM diretto su ~25 statistiche, veloce → locale.
+    # ── 2b. Baseline features (opzionale) ────────────────────────────────────
     if args.baselines:
-        tasks_bl = [
-            (S("baselines/baseline_features.py"), [], "baseline_features", CPU_PER_CLUST, 0),
-        ]
-        failed += run_parallel_ray(ray_run, tasks_bl, "[2b] Baseline features (Ray)")
-        _header("[2b] Baseline stats GMM (locale)")
-        if not run_local(S("baselines/baseline_stats_gmm.py"), label="baseline_stats_gmm"):
-            failed.append("baseline_stats_gmm")
+        _header("[2b] Baseline features")
+        for script, lbl in [
+            ("baselines/baseline_features.py",  "baseline_features"),
+            ("baselines/baseline_stats_gmm.py", "baseline_stats_gmm"),
+        ]:
+            if not run_local(S(script), label=lbl):
+                failed.append(lbl)
 
-    # ── 2. Embeddings Chronos-2 (Ray, parallelo per exp) ─────────────────────
+    # ── 2. Embeddings Chronos-2 (sequenziale per exp) ────────────────────────
     if not args.skip_emb:
         tasks = [
-            (S("pipeline/step02_embeddings.py"), ["--exp", exp],
-             f"emb_{exp}", CPU_PER_EMB, GPU_PER_EMB)
+            (S("pipeline/step02_embeddings.py"), ["--exp", exp], f"emb_{exp}")
             for exp in exps
         ]
-        failed += run_parallel_ray(ray_run, tasks, "[2] Embeddings Chronos-2")
+        failed += run_sequence(tasks, "[2] Embeddings Chronos-2")
     else:
         print("\n  [2] Embeddings: SALTATO (--skip-emb)", flush=True)
 
-    # ── 3. PCA -> UMAP -> GMM (Ray, parallelo per exp) ───────────────────────
+    # ── 3. PCA -> UMAP -> GMM (sequenziale per exp) ──────────────────────────
     tasks = [
-        (S("pipeline/step03_pca_umap_gmm.py"), ["--exp", exp],
-         f"clust_{exp}", CPU_PER_CLUST, 0)
+        (S("pipeline/step03_pca_umap_gmm.py"), ["--exp", exp], f"clust_{exp}")
         for exp in exps
     ]
-    failed += run_parallel_ray(ray_run, tasks, "[3] PCA+UMAP+GMM (K automatico)")
+    failed += run_sequence(tasks, "[3] PCA+UMAP+GMM (K automatico)")
 
-    # ── 3b. Sensitivity (Ray, opzionale) ─────────────────────────────────────
+    # ── 3b. Sensitivity (opzionale) ──────────────────────────────────────────
     if args.sensitivity:
         tasks_k = [
-            (S("sensitivity/sensitivity_K.py"), ["--exp", exp],
-             f"sens_K_{exp}", CPU_PER_CLUST, 0)
+            (S("sensitivity/sensitivity_K.py"), ["--exp", exp], f"sens_K_{exp}")
             for exp in exps
         ]
         tasks_s = [
-            (S("sensitivity/sensitivity_seed.py"), ["--exp", exp],
-             f"sens_seed_{exp}", CPU_PER_CLUST, 0)
+            (S("sensitivity/sensitivity_seed.py"), ["--exp", exp], f"sens_seed_{exp}")
             for exp in exps
         ]
-        failed += run_parallel_ray(ray_run, tasks_k, "[3b] Sensitivity-K")
-        failed += run_parallel_ray(ray_run, tasks_s, "[3b] Sensitivity-seed")
+        failed += run_sequence(tasks_k, "[3b] Sensitivity-K")
+        failed += run_sequence(tasks_s, "[3b] Sensitivity-seed")
 
-    # ── 4. Compare TOPSIS (locale) ───────────────────────────────────────────
+    # ── 4. Compare TOPSIS ────────────────────────────────────────────────────
     _header("[4] Compare (TOPSIS)")
     if not run_local(S("pipeline/step03_compare.py"), label="step03_compare"):
         failed.append("step03_compare")
 
-    # ── 3c. Clustering alternativi sul vincitore (locale, opzionale) ──────────
-    # Eseguito dopo step 4 perché richiede il vincitore (winner.json).
-    # Confronta metodi alternativi (Ward/HDBSCAN) sull'embedding dell'exp vincitore,
-    # a conferma della robustezza della struttura di regime trovata con GMM.
+    # ── 3c. Clustering alternativi sul vincitore (opzionale) ──────────────────
     if args.baselines:
         alt_exp = args.markov_exp or read_winner()
         _header(f"[3c] Clustering alternativi  exp={alt_exp}")
         if alt_exp:
-            for script, lbl in [
-                ("baselines/clustering_dendrogram.py", f"dendrogram_{alt_exp}"),
-            ]:
-                if not run_local(S(script), "--exp", alt_exp, label=lbl):
-                    failed.append(lbl)
+            if not run_local(S("baselines/clustering_dendrogram.py"),
+                             "--exp", alt_exp, label=f"dendrogram_{alt_exp}"):
+                failed.append(f"dendrogram_{alt_exp}")
         else:
-            print("  winner.json non trovato — usa --markov-exp per specificare exp", flush=True)
+            print("  winner.json non trovato — usa --markov-exp", flush=True)
 
-    # ── 3d. Diagnostics sul vincitore (opzionale) ────────────────────────────
-    # step03_interpretation espande 7174 finestre × 720h → Ray CPU task.
-    # Gli altri sono I/O-bound o veloci → locale.
+    # ── 3d. Diagnostics sul vincitore (opzionale) ─────────────────────────────
     if args.diagnostics:
         diag_exp = args.markov_exp or read_winner()
         _header(f"[3d] Diagnostics  exp={diag_exp}")
         if diag_exp:
-            # interpretation: compute-heavy (espansione finestre) → Ray
-            tasks_diag = [
-                (S("diagnostics/step03_interpretation.py"),
-                 ["--exp", diag_exp], f"diag_interpretation_{diag_exp}", CPU_PER_CLUST, 0),
-            ]
-            failed += run_parallel_ray(ray_run, tasks_diag, "[3d] Interpretation (Ray)")
-
-            # altri diagnostics: veloci → locale
             for script, lbl, extra in [
-                ("diagnostics/step01_justification.py",  "diag_step01_justification", []),
-                ("diagnostics/step02_justification.py",  "diag_step02_justification", ["--exp", diag_exp]),
-                ("diagnostics/step03_diagnostics.py",    "diag_step03_diagnostics",   ["--exp", diag_exp]),
-                ("diagnostics/step03_validation.py",     "diag_step03_validation",    ["--exp", diag_exp]),
+                ("diagnostics/step03_interpretation.py", f"interpretation_{diag_exp}", ["--exp", diag_exp]),
+                ("diagnostics/step01_justification.py",  "step01_justification",       []),
+                ("diagnostics/step02_justification.py",  "step02_justification",       ["--exp", diag_exp]),
+                ("diagnostics/step03_diagnostics.py",    "step03_diagnostics",         ["--exp", diag_exp]),
+                ("diagnostics/step03_validation.py",     "step03_validation",          ["--exp", diag_exp]),
             ]:
                 if not run_local(S(script), *extra, label=lbl):
                     failed.append(lbl)
         else:
-            print("  winner.json non trovato — usa --markov-exp per specificare exp", flush=True)
+            print("  winner.json non trovato — usa --markov-exp", flush=True)
 
-    # ── 5. Markov (locale) ───────────────────────────────────────────────────
+    # ── 5. Markov ─────────────────────────────────────────────────────────────
     markov_exp = args.markov_exp or read_winner()
     _header(f"[5] Markov  exp={markov_exp}")
     if markov_exp:
         if not run_local(S("pipeline/step04_markov.py"), "--exp", markov_exp,
-                         label=f"step04_markov exp={markov_exp}"):
+                         label=f"step04_markov_{markov_exp}"):
             failed.append(f"step04_{markov_exp}")
     else:
         print("  winner.json non trovato — usa --markov-exp", flush=True)
-
-    ray.shutdown()
 
     # ── Riepilogo ─────────────────────────────────────────────────────────────
     elapsed = time.time() - t_start
