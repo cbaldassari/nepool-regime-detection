@@ -1,0 +1,94 @@
+flowchart TD
+
+    %% ── Data source ──────────────────────────────────────────────────────────
+    RAW[(ISONE dataset\n43,789 h × 22 col\n2021–2025)]
+
+    %% ── Step 01 ──────────────────────────────────────────────────────────────
+    subgraph S1["Step 01 — Preprocessing"]
+        direction TB
+        CLEAN["Data cleaning\n• DST duplicate removal\n• EIA artefact removal"]
+
+        subgraph S1A["Price features"]
+            direction LR
+            PRICE["arcsinh_lmp · log_return\nlog_lmp_shifted · lmp_clipped\nquantile_transform · rolling_z_24h"]
+            MSTL["MSTL deseasonalisation\n(24h / 168h / 8,760h)\n→ mstl_resid_arcsinh\n→ mstl_resid_lr · mstl_resid_log"]
+            PRICE --> MSTL
+        end
+
+        subgraph S1B["Fuel-mix features"]
+            ILR["ILR transform\n8 fuel shares → 7 coordinates\n(multiplicative zero replacement δ=10⁻⁴)\nilr_1 … ilr_7"]
+        end
+
+        CLEAN --> S1A
+        CLEAN --> S1B
+    end
+
+    PRE[("preprocessed.parquet\n~43,758 h × 19 col\n(9 price + 7 ILR + datetime)")]
+
+    RAW --> S1 --> PRE
+
+    %% ── Experiments ──────────────────────────────────────────────────────────
+    subgraph EXP["Experiment design"]
+        direction LR
+        subgraph EPRICE["Price only  (A–I)"]
+            direction TB
+            EP["A  log_return\nB  arcsinh_lmp\nC  mstl_resid_lr\nD  mstl_resid_arcsinh ★\nE  log_lmp_shifted\nF  lmp_clipped\nG  mstl_resid_log\nH  quantile_transform\nI  rolling_z_24h"]
+        end
+        subgraph EABLATION["ILR ablation  (J–L)"]
+            direction TB
+            EA["J  ILR only           (7 ch)\nK  log_return + ILR   (8 ch)\nL  mstl_resid_arcsinh + ILR  (8 ch)"]
+        end
+    end
+
+    PRE --> EXP
+
+    %% ── Step 02 ──────────────────────────────────────────────────────────────
+    subgraph S2["Step 02 — Chronos-2 Embedding   [Ray · 1 GPU / exp]"]
+        direction TB
+        WIN["Sliding windows\ncontext = 720 h · stride = 6 h\n≈ 7,174 windows / exp"]
+        CHR["Chronos-2  (amazon/chronos-2 · 120M params)\nF channels × 720 steps  →  embed\n↓ mean-pool over patches\nF × D_model per window\n(F=1: univariate  |  F=7–8: multivariate)"]
+        WIN --> CHR
+    end
+
+    EMB[("exp_{X}/embeddings.parquet\n7,174 × (F × D_model)")]
+
+    EXP --> S2 --> EMB
+
+    %% ── Step 03 ──────────────────────────────────────────────────────────────
+    subgraph S3["Step 03 — Dimensionality Reduction + Clustering   [Ray · 8 CPU / exp]"]
+        direction TB
+        PCA_["StandardScaler → PCA\n→ 20-D"]
+        UMAP_["UMAP\n20-D → 10-D  (cosine metric)"]
+        GMM_["GMM  K-sweep  2 … 12\nBIC minimisation → K* optimal"]
+        QUAL["Quality metrics\nsilhouette · Davies-Bouldin · Calinski-Harabasz\nprice η² · transition rate · entropy · Cramér V"]
+        PCA_ --> UMAP_ --> GMM_ --> QUAL
+    end
+
+    LABELS[("exp_{X}/\nlabels_best.parquet\nquality_report.json")]
+
+    EMB --> S3 --> LABELS
+
+    %% ── Step 03c — TOPSIS ────────────────────────────────────────────────────
+    subgraph S3C["Step 03c — Experiment Selection  (TOPSIS)"]
+        direction TB
+        TOPSIS_["TOPSIS  (Hwang & Yoon 1981)\n6 criteria · normalised · weighted\nC_i = D⁻ / (D⁺ + D⁻)  ∈ [0,1]"]
+        WINNER["Best experiment X*\nwinner.json"]
+        TOPSIS_ --> WINNER
+    end
+
+    LABELS --> S3C
+
+    %% ── Ablation annotation ──────────────────────────────────────────────────
+    NOTE["Ablation 2×2\n───────────────────────\n        no ILR    + ILR\nlog_ret    A         K\nmstl_arc   D ★       L\nILR only   —         J"]
+
+    S3C -.-> NOTE
+
+    %% ── Styling ──────────────────────────────────────────────────────────────
+    classDef store   fill:#dce8f5,stroke:#4a86c8,color:#1a1a2e
+    classDef branch  fill:#fff7d6,stroke:#c8a400,color:#3a2e00
+    classDef result  fill:#d6f5e3,stroke:#2e9e5b,color:#0a2e18
+    classDef note    fill:#f5f5f5,stroke:#aaa,color:#444,font-size:12px
+
+    class RAW,PRE,EMB,LABELS store
+    class WINNER result
+    class NOTE note
