@@ -32,6 +32,7 @@ Uso
 ---
   python run_pipeline.py                        # tutti gli esperimenti A-O
   python run_pipeline.py --exp A B D            # solo alcuni esperimenti
+  python run_pipeline.py --skip-preproc         # salta step01 (già fatto)
   python run_pipeline.py --skip-emb             # salta step02
   python run_pipeline.py --sensitivity          # aggiunge [3b] sensitivity K/seed
   python run_pipeline.py --baselines            # aggiunge [2b] feature baseline e [3c] alt clustering
@@ -211,6 +212,8 @@ def main() -> None:
         "--exp", nargs="+", default=ALL_EXPS,
         choices=ALL_EXPS, metavar="EXP",  # A-I: price only; J-L: ILR ablation
     )
+    parser.add_argument("--skip-preproc", action="store_true",
+                        help="Salta step01 (preprocessing già fatto)")
     parser.add_argument("--skip-emb",    action="store_true")
     parser.add_argument("--sensitivity", action="store_true",
                         help="Aggiunge [3b] sensitivity-K e sensitivity-seed per ogni exp")
@@ -274,7 +277,9 @@ def main() -> None:
 
     # ── 1. Preprocessing (locale) ────────────────────────────────────────────
     _header("[1] Preprocessing")
-    if not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
+    if args.skip_preproc:
+        print("  SALTATO (--skip-preproc)", flush=True)
+    elif not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
     # ── 2b. Baseline features (Ray, opzionale) ───────────────────────────────
