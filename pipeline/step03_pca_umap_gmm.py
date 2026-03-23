@@ -985,6 +985,12 @@ def main():
     pd.DataFrame({"timestamp": ts_clean, "regime": best_labels}
                  ).to_parquet(OUT_DIR / "labels_best.parquet", index=False)
 
+    # Salva coordinate UMAP (usate da diagnostics/step03_interpretation.py)
+    if not NO_UMAP:
+        cols = {f"umap_{i+1}": E_cluster[:, i] for i in range(E_cluster.shape[1])}
+        pd.DataFrame({"datetime": ts_clean, **cols}
+                     ).to_parquet(OUT_DIR / "umap.parquet", index=False)
+
     for r in results:
         pd.DataFrame({"timestamp": ts_clean, "regime": r["labels"]}
                      ).to_parquet(

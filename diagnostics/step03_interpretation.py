@@ -459,7 +459,7 @@ def plot_umap_scatter(wstats):
     01 — UMAP 2D colorato per regime.
     Carica umap.parquet direttamente (non dipende da wstats per i punti).
     """
-    umap_df = pd.read_parquet(Path(C.RESULTS_DIR) / "umap.parquet")
+    umap_df = pd.read_parquet(Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "step03f" / "umap.parquet")
     umap_df["datetime"] = pd.to_datetime(umap_df["datetime"])
     regimes_df = pd.read_parquet(LABELS_PATH)
     regimes_df["datetime"] = pd.to_datetime(regimes_df["datetime"])
