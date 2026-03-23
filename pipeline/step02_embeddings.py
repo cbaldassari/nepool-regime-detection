@@ -80,8 +80,10 @@ EXPERIMENT = _parser.parse_known_args()[0].exp
 
 _ILR_COLS = ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]
 
-_EXP_MAP = {
-    # ── Price only (univariate) ───────────────────────────────────────────────
+# _CHRONOS_MAP: feature channel(s) fed into Chronos-2 for each experiment.
+# None = skip Chronos-2 entirely (ILR-only experiment J).
+_CHRONOS_MAP = {
+    # ── Price only (univariate) A–I ──────────────────────────────────────────
     "A": ["log_return"],            # stationary return (arcsinh diff)
     "B": ["arcsinh_lmp"],           # price level, negative-safe
     "C": ["mstl_resid_lr"],         # deseasonalized return
@@ -91,12 +93,17 @@ _EXP_MAP = {
     "G": ["mstl_resid_log"],        # deseasonalized log-level
     "H": ["quantile_transform"],    # distribution-free normal mapping
     "I": ["rolling_zscore_24h"],    # adaptive local normalization
-    # ── ILR ablation study (multivariate) ────────────────────────────────────
-    "J": _ILR_COLS,                              # ILR only   (7 ch, no price)
-    "K": ["log_return"]          + _ILR_COLS,   # A + ILR    (8 ch)
-    "L": ["mstl_resid_arcsinh"]  + _ILR_COLS,   # D + ILR    (8 ch) — best expected
+    # ── ILR ablation J–L: Chronos input (price only, ILR appended after) ────
+    "J": None,                      # ILR only — no Chronos-2
+    "K": ["log_return"],            # Chronos(log_return)  ‖ ILR
+    "L": ["mstl_resid_arcsinh"],    # Chronos(mstl_resid)  ‖ ILR
 }
-FEAT_COLS  = _EXP_MAP[EXPERIMENT]
+# Experiments that concatenate ILR AFTER the Chronos-2 embedding
+_APPEND_ILR = {"J", "K", "L"}
+
+# Feature cols used for sliding-window construction (and Chronos-2 input).
+# For J we build windows on log_return just to obtain timestamps; Chronos is skipped.
+FEAT_COLS = _CHRONOS_MAP[EXPERIMENT] or ["log_return"]
 EXP_DIR    = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}"
 
 PLOT_DIR   = EXP_DIR / "step02"
@@ -637,6 +644,42 @@ def make_plots(emb_df: pd.DataFrame) -> None:
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════
 
+def append_ilr(embeddings: np.ndarray,
+               timestamps: np.ndarray,
+               pre: pd.DataFrame) -> np.ndarray:
+    """
+    Concatenate ILR coordinates to the embedding matrix.
+
+    For each window timestamp t (last observation of the window), look up
+    the 7 ILR values in preprocessed.parquet and append them to the
+    Chronos-2 embedding row:
+        E_t = [ emb_t  ‖  ILR_t ]
+
+    If a timestamp has no ILR data (NaN — missing EIA row), the ILR slice
+    is filled with the column median so as not to discard the window.
+
+    embeddings : (N, D_model)
+    timestamps : (N,) datetime64
+    pre        : preprocessed.parquet as DataFrame (must have ILR cols)
+    returns    : (N, D_model + 7)
+    """
+    pre_ilr = pre.set_index("datetime")[_ILR_COLS]
+    ts      = pd.to_datetime(timestamps)
+    ilr_mat = pre_ilr.reindex(ts).values.astype(np.float32)   # (N, 7)
+
+    # Fill NaN rows (missing EIA data) with column medians
+    n_nan = int(np.isnan(ilr_mat).any(axis=1).sum())
+    if n_nan:
+        medians = np.nanmedian(ilr_mat, axis=0)
+        for col_i in range(ilr_mat.shape[1]):
+            mask = np.isnan(ilr_mat[:, col_i])
+            ilr_mat[mask, col_i] = medians[col_i]
+        print(f"  ⚠  ILR concat: {n_nan} timestamp(s) had NaN ILR — filled with median",
+              flush=True)
+
+    return np.concatenate([embeddings, ilr_mat], axis=1)
+
+
 def main() -> pd.DataFrame:
     t0 = time.time()
 
@@ -656,7 +699,7 @@ def main() -> pd.DataFrame:
     print("    Per window: embed(720 steps) → mean-pool patches → embedding vector.")
     print("─" * 65)
 
-    n_steps = 6
+    n_steps = 6   # 3b (ILR concat) is conditional, counted only when active
     def _step(n: int, label: str) -> None:
         print(f"\n  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -684,23 +727,39 @@ def main() -> pd.DataFrame:
           f"{pd.Timestamp(timestamps[-1]).date()}", flush=True)
 
     # ── 3. Embeddings ────────────────────────────────────────────────────────
-    _step(3, "Extract Chronos-2 embeddings")
-    try:
-        if TEST_MODE:
-            print("  [TEST MODE] Running on CPU — 50 windows only", flush=True)
-            embeddings = extract_local(windows)
-        else:
-            embeddings = extract_ray(windows)
-    except ImportError as e:
-        print(f"\n  ERROR: missing dependency — {e}")
-        print("  Install with:")
-        print("    pip install chronos-forecasting[chronos2]")
-        print("    pip install torch --extra-index-url "
-              "https://download.pytorch.org/whl/cu121")
-        sys.exit(1)
+    if EXPERIMENT == "J":
+        # ILR-only experiment: skip Chronos-2, E_t = ILR_t directly
+        _step(3, "ILR-only experiment — skip Chronos-2, use ILR directly")
+        embeddings = np.zeros((N, 0), dtype=np.float32)   # empty, will be replaced
+        _done(3, "Chronos-2 skipped (exp J)")
+    else:
+        _step(3, "Extract Chronos-2 embeddings")
+        try:
+            if TEST_MODE:
+                print("  [TEST MODE] Running on CPU — 50 windows only", flush=True)
+                embeddings = extract_local(windows)
+            else:
+                embeddings = extract_ray(windows)
+        except ImportError as e:
+            print(f"\n  ERROR: missing dependency — {e}")
+            print("  Install with:")
+            print("    pip install chronos-forecasting[chronos2]")
+            print("    pip install torch --extra-index-url "
+                  "https://download.pytorch.org/whl/cu121")
+            sys.exit(1)
+        emb_dim = embeddings.shape[1]
+        _done(3, "Extract Chronos-2 embeddings", f"shape ({N}, {emb_dim})")
+
+    # ── 3b. ILR concatenation (exp J / K / L) ────────────────────────────────
+    if EXPERIMENT in _APPEND_ILR:
+        _step(4, f"Concatenate ILR  [ emb_t ‖ ILR_t ]  (exp {EXPERIMENT})")
+        embeddings = append_ilr(embeddings, timestamps, out)
+        _done(4, "ILR concatenated",
+              f"shape ({N}, {embeddings.shape[1]})  "
+              f"= {embeddings.shape[1] - 7} Chronos + 7 ILR"
+              if EXPERIMENT != "J" else f"shape ({N}, {embeddings.shape[1]})  = 7 ILR only")
 
     emb_dim = embeddings.shape[1]
-    _done(3, "Extract Chronos-2 embeddings", f"shape ({N}, {emb_dim})")
 
     # ── 4b. Embedding sanity checks ──────────────────────────────────────────
     # Fail-fast: NaN/Inf in embeddings propagate silently through PCA and UMAP.
@@ -716,42 +775,38 @@ def main() -> pd.DataFrame:
             f"Fix: inspect windows with extreme values, or switch torch_dtype to float32."
         )
 
-    # Per-channel norm check — embedding is (N, 11 × D_model).
-    # Reshape to (N, 11, D_model) and compute per-channel mean L2 norm.
-    # A channel with mean norm < 1% of the average is effectively silent.
-    D = emb_dim // len(FEAT_COLS)
-    if emb_dim % len(FEAT_COLS) == 0:
-        E_3d = embeddings.reshape(len(embeddings), len(FEAT_COLS), D)
-        ch_norms = np.linalg.norm(E_3d, axis=2).mean(axis=0)   # (11,)
+    # Per-channel norm check (only for pure Chronos experiments A–I)
+    chronos_cols = _CHRONOS_MAP[EXPERIMENT]
+    if EXPERIMENT not in _APPEND_ILR and chronos_cols and emb_dim % len(chronos_cols) == 0:
+        D    = emb_dim // len(chronos_cols)
+        E_3d = embeddings.reshape(len(embeddings), len(chronos_cols), D)
+        ch_norms  = np.linalg.norm(E_3d, axis=2).mean(axis=0)
         threshold = 0.01 * ch_norms.mean()
-        silent = [FEAT_COLS[i] for i, v in enumerate(ch_norms) if v < threshold]
+        silent    = [chronos_cols[i] for i, v in enumerate(ch_norms) if v < threshold]
         if silent:
-            print(f"\n  ⚠  WARNING: {len(silent)} channel(s) with near-zero embedding "
-                  f"norm (<1% mean): {silent}")
-            print(f"     Per-channel norms: "
-                  f"{dict(zip(FEAT_COLS, ch_norms.round(2)))}")
+            print(f"\n  ⚠  WARNING: {len(silent)} silent Chronos channel(s): {silent}")
+            print(f"     Per-channel norms: {dict(zip(chronos_cols, ch_norms.round(2)))}")
         else:
-            print(f"\n  ✓  Embedding sanity: 0 NaN, 0 Inf, all {len(FEAT_COLS)} channels active")
-            print(f"     Per-channel norms: "
-                  f"{dict(zip(FEAT_COLS, ch_norms.round(2)))}")
+            print(f"\n  ✓  Embedding sanity: 0 NaN, 0 Inf, "
+                  f"all {len(chronos_cols)} Chronos channels active")
+            print(f"     Per-channel norms: {dict(zip(chronos_cols, ch_norms.round(2)))}")
     else:
-        print(f"\n  ✓  Embedding sanity: 0 NaN, 0 Inf  "
-              f"(emb_dim {emb_dim} not divisible by {len(FEAT_COLS)} — skip per-channel check)")
+        print(f"\n  ✓  Embedding sanity: 0 NaN, 0 Inf  (emb_dim={emb_dim})")
 
-    # ── 4. Save embeddings ───────────────────────────────────────────────────
-    _step(4, "Save embeddings")
+    # ── 5. Save embeddings ───────────────────────────────────────────────────
+    _step(5, "Save embeddings")
     emb_cols = [f"emb_{i}" for i in range(emb_dim)]
     emb_df   = pd.DataFrame(embeddings, columns=emb_cols)
     emb_df.insert(0, "datetime", pd.to_datetime(timestamps))
     out_path = EXP_DIR / "embeddings.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     emb_df.to_parquet(out_path, index=False)
-    _done(4, "Save embeddings", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(5, "Save embeddings", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
-    # ── 5. Plots ─────────────────────────────────────────────────────────────
-    _step(5, "Diagnostic plots")
+    # ── 6. Plots ─────────────────────────────────────────────────────────────
+    _step(6, "Diagnostic plots")
     make_plots(emb_df)
-    _done(5, "Diagnostic plots", f"→ {PLOT_DIR}/")
+    _done(6, "Diagnostic plots", f"→ {PLOT_DIR}/")
 
     # ── Report ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -767,10 +822,13 @@ def main() -> pd.DataFrame:
     print(f"  Stride           : {STRIDE_H:>10}h")
     print(f"  Windows produced : {N:>10,}")
     print(f"  Windows skipped  : {n_skipped:>10,}")
-    print(f"  Channels         : {len(FEAT_COLS):>10}")
-    print(f"  Encoder hidden   : {emb_dim // len(FEAT_COLS):>10}")
-    print(f"  Embedding dim    : {emb_dim:>10,}  ({len(FEAT_COLS)} × "
-          f"{emb_dim // len(FEAT_COLS)})")
+    n_chronos_ch = len(_CHRONOS_MAP[EXPERIMENT] or [])
+    chronos_dim  = emb_dim - (7 if EXPERIMENT in _APPEND_ILR else 0)
+    print(f"  Chronos channels : {n_chronos_ch:>10}")
+    print(f"  Chronos emb dim  : {chronos_dim:>10,}")
+    if EXPERIMENT in _APPEND_ILR:
+        print(f"  + ILR coords     : {'7':>10}")
+    print(f"  Total E_t dim    : {emb_dim:>10,}")
     print(f"  Output size      : {file_mb:>9.1f} MB")
     print(f"  Elapsed          : {elapsed:>9.1f}s")
     print()
