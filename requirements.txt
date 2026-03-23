@@ -1,0 +1,23 @@
+# Core data
+numpy
+pandas
+pyarrow
+
+# Visualisation
+matplotlib
+seaborn
+
+# ML / clustering
+scikit-learn
+umap-learn
+scipy
+statsmodels
+joblib
+
+# Utilities
+tqdm
+requests
+
+# Deep learning — Chronos-2 (step02)
+torch
+chronos-forecasting
