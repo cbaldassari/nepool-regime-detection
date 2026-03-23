@@ -3,32 +3,41 @@ run_pipeline.py
 ===============
 Launcher della pipeline NEPOOL Regime Detection su cluster Ray.
 
-Strategia
+Struttura
 ---------
-  Step 1  : locale, sequenziale (preprocessing unico e veloce)
-  Step 2  : Ray task per ogni esperimento (gestisce GPU/CPU automaticamente)
-  Step 3f : Ray task per ogni esperimento (CPU, joblib interno)
-  Step 3b : Ray task per ogni esperimento (sensitivity, opzionale)
-  Step 4  : locale, sequenziale (dipende dall'output del 3)
-  Step 5  : locale, sequenziale (dipende dal vincitore)
+  [1]   Preprocessing      locale   — step01_preprocessing.py
+  [2b]  Baseline features  locale   — baseline_features.py + baseline_stats_gmm.py
+                                       (opzionale, --baselines; solo preprocessed.parquet)
+  [2]   Embeddings         Ray/GPU  — step02_embeddings.py  (per exp, parallelo)
+  [3]   PCA+UMAP+GMM       Ray/CPU  — step03_pca_umap_gmm.py (per exp, parallelo)
+  [3b]  Sensitivity        Ray/CPU  — sensitivity_K.py + sensitivity_seed.py
+                                       (opzionale, --sensitivity; per exp, parallelo)
+  [4]   Compare TOPSIS     locale   — step03_compare.py → winner.json
+  [3c]  Alt clustering     locale   — clustering_dendrogram.py + clustering_hdbscan.py
+                                       (opzionale, --baselines; sul vincitore)
+  [5]   Markov             locale   — step04_markov.py (sul vincitore)
 
-Gli step 2 e 3 per gli esperimenti A-G vengono sottomessi tutti insieme
-come task Ray e girano in parallelo sui nodi disponibili del cluster.
+Esperimenti A-O:
+  A-I  : price-only (diverse trasformazioni)
+  J-L  : ILR raw (fuel-mix isometric log-ratio)
+  M-O  : ILR detrended (MSTL residui ILR)
 
 Risorse per task
 ----------------
   step02  : CPU_PER_EMB cpu + GPU_PER_EMB gpu  (default: 8 cpu, 1 gpu)
-  step03f : CPU_PER_CLUST cpu                  (default: 8 cpu, 0 gpu)
+  step03  : CPU_PER_CLUST cpu                  (default: 8 cpu, 0 gpu)
   Modifica le costanti qui sotto per adattarle al tuo cluster.
 
 Uso
 ---
-  python run_pipeline.py                    # tutti gli esperimenti A-G
-  python run_pipeline.py --exp A B D        # solo alcuni esperimenti
-  python run_pipeline.py --skip-emb        # salta step02
-  python run_pipeline.py --sensitivity     # aggiunge sensitivity_K/seed
-  python run_pipeline.py --markov-exp D    # forza esperimento per Markov
-  python run_pipeline.py --ray-address auto  # connetti a cluster Ray esterno
+  python run_pipeline.py                        # tutti gli esperimenti A-O
+  python run_pipeline.py --exp A B D            # solo alcuni esperimenti
+  python run_pipeline.py --skip-emb             # salta step02
+  python run_pipeline.py --sensitivity          # aggiunge [3b] sensitivity K/seed
+  python run_pipeline.py --baselines            # aggiunge [2b] feature baseline e [3c] alt clustering
+  python run_pipeline.py --diagnostics          # aggiunge [3d] diagnostics sul vincitore
+  python run_pipeline.py --markov-exp D         # forza esperimento per Markov/alt-clustering/diagnostics
+  python run_pipeline.py --ray-address auto     # connetti a cluster Ray esterno
 """
 
 from __future__ import annotations
@@ -203,7 +212,12 @@ def main() -> None:
         choices=ALL_EXPS, metavar="EXP",  # A-I: price only; J-L: ILR ablation
     )
     parser.add_argument("--skip-emb",    action="store_true")
-    parser.add_argument("--sensitivity", action="store_true")
+    parser.add_argument("--sensitivity", action="store_true",
+                        help="Aggiunge [3b] sensitivity-K e sensitivity-seed per ogni exp")
+    parser.add_argument("--baselines",   action="store_true",
+                        help="Aggiunge [2b] baseline features e [3c] clustering alternativi sul vincitore")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Aggiunge [3d] diagnostics sul vincitore (MI, persistence, interpretation, validation, justification)")
     parser.add_argument("--markov-exp",  default=None, metavar="EXP")
     parser.add_argument(
         "--ray-address", default="auto",
@@ -263,6 +277,18 @@ def main() -> None:
     if not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
+    # ── 2b. Baseline features (locale, opzionale) ────────────────────────────
+    # Baseline senza embedding neurale: feature statistiche per finestra.
+    # Non dipende da step02 — legge solo preprocessed.parquet.
+    if args.baselines:
+        _header("[2b] Baseline features (senza embedding)")
+        for script, lbl in [
+            ("baselines/baseline_features.py",  "baseline_features"),
+            ("baselines/baseline_stats_gmm.py", "baseline_stats_gmm"),
+        ]:
+            if not run_local(S(script), label=lbl):
+                failed.append(lbl)
+
     # ── 2. Embeddings Chronos-2 (Ray, parallelo per exp) ─────────────────────
     if not args.skip_emb:
         tasks = [
@@ -301,6 +327,40 @@ def main() -> None:
     _header("[4] Compare (TOPSIS)")
     if not run_local(S("pipeline/step03_compare.py"), label="step03_compare"):
         failed.append("step03_compare")
+
+    # ── 3c. Clustering alternativi sul vincitore (locale, opzionale) ──────────
+    # Eseguito dopo step 4 perché richiede il vincitore (winner.json).
+    # Confronta metodi alternativi (Ward/HDBSCAN) sull'embedding dell'exp vincitore,
+    # a conferma della robustezza della struttura di regime trovata con GMM.
+    if args.baselines:
+        alt_exp = args.markov_exp or read_winner()
+        _header(f"[3c] Clustering alternativi  exp={alt_exp}")
+        if alt_exp:
+            for script, lbl in [
+                ("baselines/clustering_dendrogram.py", f"dendrogram_{alt_exp}"),
+            ]:
+                if not run_local(S(script), "--exp", alt_exp, label=lbl):
+                    failed.append(lbl)
+        else:
+            print("  winner.json non trovato — usa --markov-exp per specificare exp", flush=True)
+
+    # ── 3d. Diagnostics sul vincitore (locale, opzionale) ────────────────────
+    if args.diagnostics:
+        diag_exp = args.markov_exp or read_winner()
+        _header(f"[3d] Diagnostics  exp={diag_exp}")
+        if diag_exp:
+            # step01/02 justification: giustificazioni per reviewer (no --exp / con --exp)
+            for script, lbl, extra in [
+                ("diagnostics/step01_justification.py",  "diag_step01_justification", []),
+                ("diagnostics/step02_justification.py",  "diag_step02_justification", ["--exp", diag_exp]),
+                ("diagnostics/step03_diagnostics.py",    "diag_step03_diagnostics",   ["--exp", diag_exp]),
+                ("diagnostics/step03_interpretation.py", "diag_step03_interpretation",["--exp", diag_exp]),
+                ("diagnostics/step03_validation.py",     "diag_step03_validation",    ["--exp", diag_exp]),
+            ]:
+                if not run_local(S(script), *extra, label=lbl):
+                    failed.append(lbl)
+        else:
+            print("  winner.json non trovato — usa --markov-exp per specificare exp", flush=True)
 
     # ── 5. Markov (locale) ───────────────────────────────────────────────────
     markov_exp = args.markov_exp or read_winner()

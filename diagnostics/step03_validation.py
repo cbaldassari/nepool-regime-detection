@@ -71,16 +71,25 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config as C
+
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--exp", default="D",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
+EXPERIMENT = _parser.parse_known_args()[0].exp
+
 # =============================================================================
 # CONFIGURAZIONE
 # =============================================================================
 
-# Etichette da validare — cambia qui per usare step03b, step03 o step03c
-LABELS_PATH   = Path("results/step03c/labels_best.parquet")
+LABELS_PATH   = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "step03f" / "labels_best.parquet"
 LABEL_COL     = None   # None = auto-detect (prima colonna non-timestamp)
 
-PREPROCESSED  = Path("results/preprocessed.parquet")
-OUT_DIR       = Path("results/step03e")
+PREPROCESSED  = Path(C.RESULTS_DIR) / "preprocessed.parquet"
+OUT_DIR       = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "validation"
 
 # Ore di contesto per finestra (deve coincidere con step02)
 CONTEXT_H     = 720

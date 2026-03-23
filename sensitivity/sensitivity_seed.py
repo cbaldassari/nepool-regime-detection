@@ -56,7 +56,9 @@ warnings.filterwarnings("ignore")
 
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--exp", default="D", choices=["A","B","C","D","E","F","G"])
+_parser.add_argument("--exp", default="D",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
 EXPERIMENT = _parser.parse_known_args()[0].exp
 
 SEEDS = [42, 123, 456, 789, 1234]   # seed da testare

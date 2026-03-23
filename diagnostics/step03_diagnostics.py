@@ -41,11 +41,20 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as C
 
-PLOT_DIR    = Path(C.RESULTS_DIR) / "step03c"
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--exp", default="D",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
+EXPERIMENT  = _parser.parse_known_args()[0].exp
+
 RESULTS_DIR = Path(C.RESULTS_DIR)
+EXP_DIR     = RESULTS_DIR / f"exp_{EXPERIMENT}"
+PLOT_DIR    = EXP_DIR / "diagnostics"
+LABELS_PATH = EXP_DIR / "step03f" / "labels_best.parquet"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -293,8 +302,8 @@ def main():
     print("─" * 65)
 
     # ── Carica dati ──────────────────────────────────────────────────────
-    regime_path = RESULTS_DIR / "regimes.parquet"
-    pre_path    = RESULTS_DIR / "preprocessed.parquet"
+    regime_path = LABELS_PATH
+    pre_path    = RESULTS_DIR / "preprocessed.parquet"  # invariato per tutti gli exp
 
     if not regime_path.exists():
         print(f"  ERRORE: {regime_path} non trovato. Esegui step03 prima.")
@@ -317,7 +326,7 @@ def main():
     # ── 1. Mutual Information Test ────────────────────────────────────────
     print("[1/2] Mutual Information Test ...")
     mi_df = mutual_information_test(pre, regimes)
-    mi_path = RESULTS_DIR / "mi_test.csv"
+    mi_path = PLOT_DIR / "mi_test.csv"
     mi_df.to_csv(mi_path, index=False)
     plot_mi(mi_df)
 
@@ -352,7 +361,7 @@ def main():
             "mean_duration_h" : res["mean_duration_h"][r],
         })
     pers_df = pd.DataFrame(pers_rows)
-    pers_path = RESULTS_DIR / "persistence_test.csv"
+    pers_path = PLOT_DIR / "persistence_test.csv"
     pers_df.to_csv(pers_path, index=False)
 
     print(f"\n  Persistence per regime:")

@@ -1,6 +1,6 @@
 """
-step03f_pca_umap_gmm.py
-=======================
+step03_pca_umap_gmm.py
+======================
 Clustering su embedding Chronos2 con pipeline:
 
   Embedding 7680D

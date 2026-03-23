@@ -58,8 +58,15 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as C
+
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--exp", default="D",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
+EXPERIMENT = _parser.parse_known_args()[0].exp
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ▶▶  CONFIGURAZIONE  ◀◀
@@ -71,7 +78,8 @@ import config as C
 FORCE_RECOMPUTE = False
 
 # Cartella di output
-OUT_DIR = Path(C.RESULTS_DIR) / "step03d"
+OUT_DIR      = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "interpretation"
+LABELS_PATH  = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "step03f" / "labels_best.parquet"
 
 # Ore di contesto per finestra (deve corrispondere a step02)
 CONTEXT_H = C.MEAN_REVERSION["context_len"]   # 720
@@ -262,7 +270,7 @@ def load_or_compute():
         return wstats, rstats
 
     print("Caricamento dati …")
-    regimes_df = pd.read_parquet(Path(C.RESULTS_DIR) / "regimes.parquet")
+    regimes_df = pd.read_parquet(LABELS_PATH)
     regimes_df["datetime"] = pd.to_datetime(regimes_df["datetime"])
 
     pre_df = pd.read_parquet(Path(C.RESULTS_DIR) / "preprocessed.parquet")
@@ -453,7 +461,7 @@ def plot_umap_scatter(wstats):
     """
     umap_df = pd.read_parquet(Path(C.RESULTS_DIR) / "umap.parquet")
     umap_df["datetime"] = pd.to_datetime(umap_df["datetime"])
-    regimes_df = pd.read_parquet(Path(C.RESULTS_DIR) / "regimes.parquet")
+    regimes_df = pd.read_parquet(LABELS_PATH)
     regimes_df["datetime"] = pd.to_datetime(regimes_df["datetime"])
     merged = umap_df.merge(regimes_df, on="datetime", how="left")
 

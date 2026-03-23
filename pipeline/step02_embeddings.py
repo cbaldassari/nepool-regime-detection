@@ -3,9 +3,9 @@ step02_embeddings.py
 ====================
 NEPOOL Regime Detection Pipeline — Step 02: Chronos-2 Embedding Extraction
 
-Input  : results/preprocessed.parquet   (43,764 rows × 12 cols)
-Output : results/embeddings.parquet     (N_windows × [datetime + emb_0…emb_D-1])
-Plots  : results/step02/
+Input  : results/preprocessed.parquet   (43,794 rows × 25+ cols)
+Output : results/exp_{X}/embeddings.parquet   (N_windows × [datetime + emb_0…emb_D-1])
+Plots  : results/exp_{X}/step02/
 
 Design
 ------
@@ -15,21 +15,35 @@ Context length (data-driven, confirmed by ACF analysis):
   • Context = 720h: captures ≥4 weekly cycles + 1 monthly dispatch cycle
 
 Sliding windows:
-  • Stride = 6h  →  (43764 − 720) / 6 ≈ 7,174 windows
+  • Stride = 6h  →  (43794 − 720) / 6 ≈ 7,179 windows
   • Timestamp = LAST observation of each window
   • Windows straddling the 25h gap (2023-06-15) are skipped automatically
 
-Chronos-2 encoder (amazon/chronos-2 — 120M params, released Oct 2025):
-  • Native multivariate — all 11 channels passed as a single group per window
-  • Group attention captures cross-channel dependencies (e.g. LMP vs fuel mix)
-  • Per window: embed(group of 11 series × 720 steps) → (11, n_patches, D_model)
-  • Mean-pool over patch dimension: (11, D_model)
-  • Concatenate channels: final embedding = 11 × D_model per window
-  • D_model inferred dynamically at runtime (expected ~512)
+Experiments and embedding architecture
+---------------------------------------
+  A–I : price-only univariate.
+        embed(price_feature, 720 steps) → mean-pool patches → D_model-dim vector.
+        D_model = 768 (Chronos-2 base).
+
+  J   : ILR-only (raw).    No Chronos-2. Embedding = ILR raw values at window timestamp (7D).
+  M   : ILR-only (detrended). No Chronos-2. Embedding = ILR detrended values at timestamp (7D).
+
+  K,L : Chronos-2(price) ‖ ILR raw.
+        Chronos-2 encodes a single price series (univariate, 768D),
+        then the 7 ILR raw coordinates at the window timestamp are concatenated:
+        E_t = [ Chronos(price_t)  ‖  ILR_raw_t ]  →  (768 + 7 = 775D)
+
+  N,O : Chronos-2(price) ‖ ILR detrended.
+        Same as K/L but using MSTL-detrended ILR coordinates:
+        E_t = [ Chronos(price_t)  ‖  ILR_det_t ]  →  (768 + 7 = 775D)
+
+  ILR concatenation is performed AFTER Chronos-2 (not as input channels).
+  ILR values are matched by timestamp (last step of each window).
+  NaN ILR rows (missing EIA data) are filled with column median.
 
 Execution modes:
   • TEST_MODE = True  → 50 windows, local CPU, no Ray  (quick sanity check)
-  • TEST_MODE = False → all windows, Ray cluster 3×GPU  (production run)
+  • TEST_MODE = False → all windows, Ray cluster GPU  (production run)
 
 Install dependencies:
     pip install "chronos-forecasting[chronos2]" ray[default]
@@ -703,17 +717,16 @@ def main() -> pd.DataFrame:
     print("\n" + "═" * 65)
     print("  NEPOOL Regime Detection  —  Step 02: Chronos-2 Embeddings")
     print("═" * 65)
+    ilr_note = (f" ‖ ILR({'+'.join(_ILR_COLS_MAP[EXPERIMENT][:1])}…)"
+                if EXPERIMENT in _APPEND_ILR else "")
+    chron_feat = (_CHRONOS_MAP[EXPERIMENT] or ["— skipped (ILR-only)"])[0]
+    print(f"  Experiment : {EXPERIMENT}  |  Chronos input: {chron_feat}{ilr_note}")
     print(f"  Input   : {C.RESULTS_DIR}/preprocessed.parquet")
-    print(f"  Output  : {C.RESULTS_DIR}/embeddings.parquet")
+    print(f"  Output  : {EXP_DIR}/embeddings.parquet")
     print(f"  Plots   : {PLOT_DIR}/")
-    print(f"  Model   : {CHRONOS_MODEL}  (multivariate, 120M params)")
-    print(f"  Context : {CONTEXT_LEN}h  (30 days)")
-    print(f"  Stride  : {STRIDE_H}h")
+    print(f"  Model   : {CHRONOS_MODEL}  (120M params, D_model=768)")
+    print(f"  Context : {CONTEXT_LEN}h  stride={STRIDE_H}h")
     print(f"  Cluster : ray://datalab-rayclnt.unitus.it:10001  ({N_GPUS}×GPU)")
-    print()
-    print("  Embedding strategy:")
-    print("    1 price channel per experiment (A/B/C/D) → Chronos-2 univariate encoder.")
-    print("    Per window: embed(720 steps) → mean-pool patches → embedding vector.")
     print("─" * 65)
 
     n_steps = 6   # 3b (ILR concat) is conditional, counted only when active
@@ -744,11 +757,11 @@ def main() -> pd.DataFrame:
           f"{pd.Timestamp(timestamps[-1]).date()}", flush=True)
 
     # ── 3. Embeddings ────────────────────────────────────────────────────────
-    if EXPERIMENT == "J":
-        # ILR-only experiment: skip Chronos-2, E_t = ILR_t directly
-        _step(3, "ILR-only experiment — skip Chronos-2, use ILR directly")
-        embeddings = np.zeros((N, 0), dtype=np.float32)   # empty, will be replaced
-        _done(3, "Chronos-2 skipped (exp J)")
+    if _CHRONOS_MAP[EXPERIMENT] is None:
+        # ILR-only experiments (J, M): skip Chronos-2, E_t = ILR_t directly
+        _step(3, f"ILR-only experiment ({EXPERIMENT}) — skip Chronos-2, use ILR directly")
+        embeddings = np.zeros((N, 0), dtype=np.float32)   # empty, will be replaced by append_ilr
+        _done(3, f"Chronos-2 skipped (exp {EXPERIMENT})")
     else:
         _step(3, "Extract Chronos-2 embeddings")
         try:

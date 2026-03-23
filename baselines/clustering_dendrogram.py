@@ -52,8 +52,15 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as C
+
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--exp", default="D",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
+EXPERIMENT = _parser.parse_known_args()[0].exp
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ▶▶  CONFIGURAZIONE  ◀◀
@@ -84,7 +91,7 @@ PALETTE = [
     "#7570b3","#e7298a","#66a61e","#e6ab02",
 ]
 
-OUT_DIR      = Path(C.RESULTS_DIR) / "step03b"
+OUT_DIR      = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "step03b_dendrogram"
 RANDOM_STATE = 42
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -92,7 +99,7 @@ RANDOM_STATE = 42
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_and_reduce():
-    emb_path = Path(C.RESULTS_DIR) / "embeddings.parquet"
+    emb_path = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}" / "embeddings.parquet"
     if not emb_path.exists():
         raise FileNotFoundError(f"{emb_path} non trovato — esegui step02 prima.")
 

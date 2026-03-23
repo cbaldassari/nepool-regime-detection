@@ -62,14 +62,15 @@ sys.path.insert(0, str(ROOT))
 import config as C
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--exp", default="F",
-                    choices=["A","B","C","D","E","F","G","H","I"])
+parser.add_argument("--exp", default="D",
+                    choices=["A","B","C","D","E","F","G","H","I",
+                             "J","K","L","M","N","O"])
 args = parser.parse_args()
 EXP = args.exp
 
 RESULTS_DIR = ROOT / C.RESULTS_DIR
-EMB_PATH    = RESULTS_DIR / f"step02/exp_{EXP}/embeddings.parquet"
-LABELS_PATH = RESULTS_DIR / f"step03f/exp_{EXP}/labels_best.parquet"
+EMB_PATH    = RESULTS_DIR / f"exp_{EXP}" / "embeddings.parquet"
+LABELS_PATH = RESULTS_DIR / f"exp_{EXP}" / "step03f" / "labels_best.parquet"
 PREP_PATH   = RESULTS_DIR / "preprocessed.parquet"
 OUT_DIR     = RESULTS_DIR / "step02_justification"
 OUT_DIR.mkdir(parents=True, exist_ok=True)

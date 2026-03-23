@@ -68,12 +68,18 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+import config as C
+
+_ROOT = Path(__file__).parent.parent.resolve()
+
 # =============================================================================
 # CONFIGURAZIONE
 # =============================================================================
 
-PREPROCESSED    = Path("results/preprocessed.parquet")
-OUT_DIR         = Path("results/step03g")
+PREPROCESSED    = _ROOT / C.RESULTS_DIR / "preprocessed.parquet"
+OUT_DIR         = _ROOT / C.RESULTS_DIR / "step03g"
 
 CONTEXT_H       = 720     # ore per finestra (30 giorni)
 STRIDE_H        = 6       # stride tra finestre

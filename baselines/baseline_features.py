@@ -61,19 +61,25 @@ from umap import UMAP
 
 warnings.filterwarnings("ignore")
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+import config as C
+
+_ROOT = Path(__file__).parent.parent.resolve()
+
 # =============================================================================
 # CONFIGURAZIONE
 # =============================================================================
 
-PREPROC_PATH  = Path("results/preprocessed.parquet")
+PREPROC_PATH  = _ROOT / C.RESULTS_DIR / "preprocessed.parquet"
 FEAT_COL      = "mstl_resid_arcsinh"   # stessa feature di Exp D
 CONTEXT_LEN   = 720                    # ore (= finestra Chronos-2)
 STRIDE_H      = 6
 GAP_FROM      = pd.Timestamp("2023-06-14 23:00:00")
 GAP_TO        = pd.Timestamp("2023-06-16 00:00:00")
 
-OUT_DIR       = Path("results/exp_baseline/step03f")
-CHRONOS_QR    = Path("results/exp_D/step03f/quality_report.json")
+OUT_DIR       = _ROOT / C.RESULTS_DIR / "exp_baseline" / "step03f"
+CHRONOS_QR    = _ROOT / C.RESULTS_DIR / "exp_D" / "step03f" / "quality_report.json"
 
 PCA_COMPONENTS   = 20
 UMAP_COMPONENTS  = 3
