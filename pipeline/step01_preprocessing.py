@@ -356,7 +356,7 @@ def main() -> pd.DataFrame:
     print("    • mstl_resid_arcsinh, mstl_resid_lr")
     print("─" * 65)
 
-    n_steps = 8
+    n_steps = 7
     def _step(n: int, label: str) -> None:
         print(f"  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -451,60 +451,67 @@ def main() -> pd.DataFrame:
     out       = pd.concat([df[["datetime"]], feat], axis=1)
     _done(4, "Assembly & validation", f"{len(out):,} righe  ×  {out.shape[1]} colonne")
 
-    # ── 5. MSTL deseasonalization ────────────────────────────────────────────
-    _step(5, "MSTL deseasonalization  (periodi: 24h, 168h, 8760h)")
-    from statsmodels.tsa.seasonal import MSTL
-    for src_col, dst_col in [("arcsinh_lmp",     "mstl_resid_arcsinh"),
-                              ("log_return",      "mstl_resid_lr"),
-                              ("log_lmp_shifted", "mstl_resid_log")]:
-        series = out[src_col].fillna(0).values
-        mstl   = MSTL(series, periods=[24, 168, 8760], windows=[25, 169, 8761])
-        res    = mstl.fit()
-        out[dst_col] = res.resid
-        print(f"    {src_col} -> {dst_col}  "
-              f"(resid std={res.resid.std():.4f})", flush=True)
-    _done(5, "MSTL deseasonalization",
-          "colonne aggiunte: mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log")
-
-    # ── 5b. ILR fuel-mix coordinates ─────────────────────────────────────────
-    _step(6, "ILR fuel-mix coordinates  (ilr_1 … ilr_7)")
+    # ── 5. ILR fuel-mix coordinates ──────────────────────────────────────────
+    _step(5, "ILR fuel-mix coordinates  (ilr_1 … ilr_7)")
     ilr = build_ilr_features(df)
     n_ilr_nan = ilr.isnull().any(axis=1).sum()
     out = pd.concat([out, ilr], axis=1)
     for col in ilr.columns:
         print(f"    {col}  mean={out[col].mean():.4f}  std={out[col].std():.4f}",
               flush=True)
-    _done(6, "ILR fuel-mix coordinates",
+    _done(5, "ILR fuel-mix coordinates",
           f"7 colonne aggiunte  |  {n_ilr_nan} righe con NaN (EIA missing)")
 
-    # ── 6b. MSTL deseasonalisation of ILR coordinates ────────────────────────
-    # ILR coordinates carry strong seasonal signals:
-    #   ilr_7 (solar vs wind) → near-deterministic 24h cycle (solar = 0 at night)
-    #   ilr_6 (hydro vs intermittent) → strong annual cycle (spring snowmelt)
-    #   ilr_1 (dispatch vs variable) → weekly + annual cycles
-    # We remove the same three periods used for price features (24h/168h/8760h)
-    # and store the residuals as mstl_resid_ilr_1…7 alongside the raw ilr_1…7.
-    _step(7, "MSTL deseasonalisation of ILR  (periodi: 24h, 168h, 8760h)")
-    from statsmodels.tsa.seasonal import MSTL as _MSTL
-    for raw_col in ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]:
-        dst_col = f"mstl_resid_{raw_col}"
-        series  = out[raw_col].fillna(out[raw_col].median()).values
-        mstl    = _MSTL(series, periods=[24, 168, 8760], windows=[25, 169, 8761])
-        res     = mstl.fit()
-        out[dst_col] = res.resid
-        # Propagate NaN from the raw column to the residual
-        out.loc[out[raw_col].isna(), dst_col] = np.nan
-        print(f"    {raw_col} -> {dst_col}  "
-              f"(resid std={res.resid.std():.4f})", flush=True)
-    _done(7, "MSTL ILR deseasonalisation",
-          "colonne aggiunte: mstl_resid_ilr_1 … mstl_resid_ilr_7")
+    # ── 6. MSTL deseasonalization — price + ILR (parallelo) ─────────────────
+    # All 10 series are fit in parallel (joblib) — ~10x faster than sequential.
+    # Price series: 3 fits.  ILR series: 7 fits.  Total: 10 fits.
+    # NaN in ILR raw cols are filled with median before fitting, then restored.
+    _step(6, "MSTL deseasonalization  (10 serie in parallelo, periodi: 24h/168h/8760h)")
+    from statsmodels.tsa.seasonal import MSTL
+    from joblib import Parallel, delayed
 
-    # ── 8. Save ──────────────────────────────────────────────────────────────
-    _step(8, "Saving output")
+    mstl_jobs = [
+        # price
+        ("arcsinh_lmp",     "mstl_resid_arcsinh",    False),
+        ("log_return",      "mstl_resid_lr",          False),
+        ("log_lmp_shifted", "mstl_resid_log",         False),
+        # ILR
+        ("ilr_1",  "mstl_resid_ilr_1", True),
+        ("ilr_2",  "mstl_resid_ilr_2", True),
+        ("ilr_3",  "mstl_resid_ilr_3", True),
+        ("ilr_4",  "mstl_resid_ilr_4", True),
+        ("ilr_5",  "mstl_resid_ilr_5", True),
+        ("ilr_6",  "mstl_resid_ilr_6", True),
+        ("ilr_7",  "mstl_resid_ilr_7", True),
+    ]
+
+    def _fit_mstl(src_col, dst_col, is_ilr):
+        nan_mask = out[src_col].isna() if is_ilr else None
+        fill_val = out[src_col].median() if is_ilr else 0.0
+        series   = out[src_col].fillna(fill_val).values
+        res      = MSTL(series, periods=[24, 168, 8760],
+                        windows=[25, 169, 8761]).fit()
+        resid    = res.resid.copy()
+        if is_ilr and nan_mask is not None:
+            resid[nan_mask.values] = np.nan
+        return dst_col, resid
+
+    results = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_fit_mstl)(src, dst, ilr_flag)
+        for src, dst, ilr_flag in mstl_jobs
+    )
+    for dst_col, resid in results:
+        out[dst_col] = resid
+        print(f"    -> {dst_col}  (resid std={np.nanstd(resid):.4f})", flush=True)
+    _done(6, "MSTL deseasonalization",
+          "colonne aggiunte: mstl_resid_arcsinh/lr/log + mstl_resid_ilr_1…7")
+
+    # ── 7. Save ──────────────────────────────────────────────────────────────
+    _step(7, "Saving output")
     out_path = Path(C.RESULTS_DIR) / "preprocessed.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_path, index=False)
-    _done(8, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(7, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
     # ── Plots ────────────────────────────────────────────────────────────────
     make_plots(out, df_clean)
