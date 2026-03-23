@@ -277,17 +277,17 @@ def main() -> None:
     if not run_local(S("pipeline/step01_preprocessing.py"), label="step01"):
         failed.append("step01")
 
-    # ── 2b. Baseline features (locale, opzionale) ────────────────────────────
-    # Baseline senza embedding neurale: feature statistiche per finestra.
-    # Non dipende da step02 — legge solo preprocessed.parquet.
+    # ── 2b. Baseline features (Ray, opzionale) ───────────────────────────────
+    # baseline_features: PCA+UMAP+GMM su feature manuali (~10-20 min) → Ray CPU task.
+    # baseline_stats_gmm: GMM diretto su ~25 statistiche, veloce → locale.
     if args.baselines:
-        _header("[2b] Baseline features (senza embedding)")
-        for script, lbl in [
-            ("baselines/baseline_features.py",  "baseline_features"),
-            ("baselines/baseline_stats_gmm.py", "baseline_stats_gmm"),
-        ]:
-            if not run_local(S(script), label=lbl):
-                failed.append(lbl)
+        tasks_bl = [
+            (S("baselines/baseline_features.py"), [], "baseline_features", CPU_PER_CLUST, 0),
+        ]
+        failed += run_parallel_ray(ray_run, tasks_bl, "[2b] Baseline features (Ray)")
+        _header("[2b] Baseline stats GMM (locale)")
+        if not run_local(S("baselines/baseline_stats_gmm.py"), label="baseline_stats_gmm"):
+            failed.append("baseline_stats_gmm")
 
     # ── 2. Embeddings Chronos-2 (Ray, parallelo per exp) ─────────────────────
     if not args.skip_emb:
@@ -344,17 +344,25 @@ def main() -> None:
         else:
             print("  winner.json non trovato — usa --markov-exp per specificare exp", flush=True)
 
-    # ── 3d. Diagnostics sul vincitore (locale, opzionale) ────────────────────
+    # ── 3d. Diagnostics sul vincitore (opzionale) ────────────────────────────
+    # step03_interpretation espande 7174 finestre × 720h → Ray CPU task.
+    # Gli altri sono I/O-bound o veloci → locale.
     if args.diagnostics:
         diag_exp = args.markov_exp or read_winner()
         _header(f"[3d] Diagnostics  exp={diag_exp}")
         if diag_exp:
-            # step01/02 justification: giustificazioni per reviewer (no --exp / con --exp)
+            # interpretation: compute-heavy (espansione finestre) → Ray
+            tasks_diag = [
+                (S("diagnostics/step03_interpretation.py"),
+                 ["--exp", diag_exp], f"diag_interpretation_{diag_exp}", CPU_PER_CLUST, 0),
+            ]
+            failed += run_parallel_ray(ray_run, tasks_diag, "[3d] Interpretation (Ray)")
+
+            # altri diagnostics: veloci → locale
             for script, lbl, extra in [
                 ("diagnostics/step01_justification.py",  "diag_step01_justification", []),
                 ("diagnostics/step02_justification.py",  "diag_step02_justification", ["--exp", diag_exp]),
                 ("diagnostics/step03_diagnostics.py",    "diag_step03_diagnostics",   ["--exp", diag_exp]),
-                ("diagnostics/step03_interpretation.py", "diag_step03_interpretation",["--exp", diag_exp]),
                 ("diagnostics/step03_validation.py",     "diag_step03_validation",    ["--exp", diag_exp]),
             ]:
                 if not run_local(S(script), *extra, label=lbl):
