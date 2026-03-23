@@ -75,10 +75,13 @@ MAX_RETRIES   = 3                           # Ray actor retries on node failure
 #   D -> mstl_resid_arcsinh  (MSTL residuo di arcsinh_lmp)
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G","H","I"])
+_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G","H","I","J","K","L"])
 EXPERIMENT = _parser.parse_known_args()[0].exp
 
+_ILR_COLS = ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]
+
 _EXP_MAP = {
+    # ── Price only (univariate) ───────────────────────────────────────────────
     "A": ["log_return"],            # stationary return (arcsinh diff)
     "B": ["arcsinh_lmp"],           # price level, negative-safe
     "C": ["mstl_resid_lr"],         # deseasonalized return
@@ -88,6 +91,10 @@ _EXP_MAP = {
     "G": ["mstl_resid_log"],        # deseasonalized log-level
     "H": ["quantile_transform"],    # distribution-free normal mapping
     "I": ["rolling_zscore_24h"],    # adaptive local normalization
+    # ── ILR ablation study (multivariate) ────────────────────────────────────
+    "J": _ILR_COLS,                              # ILR only   (7 ch, no price)
+    "K": ["log_return"]          + _ILR_COLS,   # A + ILR    (8 ch)
+    "L": ["mstl_resid_arcsinh"]  + _ILR_COLS,   # D + ILR    (8 ch) — best expected
 }
 FEAT_COLS  = _EXP_MAP[EXPERIMENT]
 EXP_DIR    = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}"

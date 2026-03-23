@@ -46,7 +46,7 @@ from pathlib import Path
 # =============================================================================
 
 PYTHON      = sys.executable
-ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
+ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
 RESULTS_DIR = Path("results")
 
 # Directory del progetto — usata per costruire path assoluti degli script
@@ -198,7 +198,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--exp", nargs="+", default=ALL_EXPS,
-        choices=ALL_EXPS, metavar="EXP",
+        choices=ALL_EXPS, metavar="EXP",  # A-I: price only; J-L: ILR ablation
     )
     parser.add_argument("--skip-emb",    action="store_true")
     parser.add_argument("--sensitivity", action="store_true")

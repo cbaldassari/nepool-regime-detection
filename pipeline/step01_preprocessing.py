@@ -75,6 +75,65 @@ FUEL_COLORS  = ["#e07b39", "#7b52ab", "#4da6e8", "#6abf69", "#f7c948",
 #  Feature builders
 # ═══════════════════════════════════════════════════════════════════════════
 
+def build_ilr_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute 7 ILR (Isometric Log-Ratio) coordinates from the 8 fuel share
+    columns using the Sequential Binary Partition defined in config.ILR.
+
+    Partition (SBP):
+      ilr_1 : Dispatchable (Gas,Nuc,Coal,Oil,Other) vs Variable (Hydro,Wind,Solar)
+      ilr_2 : Fossil (Gas,Coal,Oil) vs Non-fossil dispatchable (Nuc,Other)
+      ilr_3 : Gas vs Solid+Liquid fossil (Coal,Oil)
+      ilr_4 : Coal vs Oil
+      ilr_5 : Nuclear vs Other
+      ilr_6 : Hydro vs Intermittent (Wind,Solar)
+      ilr_7 : Solar vs Wind
+
+    Zero replacement: multiplicative method (Martín-Fernández et al. 2003),
+    delta = C.ILR["zero_replacement_delta"] (default 1e-4).
+    Rows with all-zero shares (missing EIA data) are set to NaN.
+    """
+    delta     = C.ILR["zero_replacement_delta"]
+    fuel_cols = C.ILR["fuel_cols"]
+    fuel_cols = [c for c in fuel_cols if c in df.columns]
+
+    shares = df[fuel_cols].fillna(0.0).values.astype(np.float64)
+
+    # Identify rows where all shares are zero (missing EIA data)
+    all_zero = shares.sum(axis=1) == 0
+
+    # Multiplicative zero replacement: replace zeros with delta, then renormalise
+    shares[shares <= 0] = delta
+    shares = shares / shares.sum(axis=1, keepdims=True)
+
+    log_s = np.log(shares)   # (N, 8)
+
+    # Columns order matches fuel_cols:
+    # 0=natural_gas, 1=nuclear, 2=hydro, 3=wind, 4=solar, 5=coal, 6=oil, 7=other
+    GAS, NUC, HYD, WIN, SOL, COA, OIL, OTH = range(8)
+
+    def balance(pos_idx: list, neg_idx: list) -> np.ndarray:
+        r_p   = len(pos_idx)
+        r_n   = len(neg_idx)
+        coeff = np.sqrt(r_p * r_n / (r_p + r_n))
+        return coeff * (log_s[:, pos_idx].mean(axis=1) -
+                        log_s[:, neg_idx].mean(axis=1))
+
+    ilr = pd.DataFrame({
+        "ilr_1": balance([GAS, NUC, COA, OIL, OTH], [HYD, WIN, SOL]),
+        "ilr_2": balance([GAS, COA, OIL],            [NUC, OTH]),
+        "ilr_3": balance([GAS],                      [COA, OIL]),
+        "ilr_4": balance([COA],                      [OIL]),
+        "ilr_5": balance([NUC],                      [OTH]),
+        "ilr_6": balance([HYD],                      [WIN, SOL]),
+        "ilr_7": balance([SOL],                      [WIN]),
+    }, index=df.index)
+
+    # Propagate missing-data flag
+    ilr.loc[all_zero] = np.nan
+    return ilr
+
+
 def build_price_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build price-derived features.
@@ -297,7 +356,7 @@ def main() -> pd.DataFrame:
     print("    • mstl_resid_arcsinh, mstl_resid_lr")
     print("─" * 65)
 
-    n_steps = 6
+    n_steps = 7
     def _step(n: int, label: str) -> None:
         print(f"  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -407,12 +466,23 @@ def main() -> pd.DataFrame:
     _done(5, "MSTL deseasonalization",
           "colonne aggiunte: mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log")
 
-    # ── 6. Save ──────────────────────────────────────────────────────────────
-    _step(6, "Saving output")
+    # ── 5b. ILR fuel-mix coordinates ─────────────────────────────────────────
+    _step(6, "ILR fuel-mix coordinates  (ilr_1 … ilr_7)")
+    ilr = build_ilr_features(df)
+    n_ilr_nan = ilr.isnull().any(axis=1).sum()
+    out = pd.concat([out, ilr], axis=1)
+    for col in ilr.columns:
+        print(f"    {col}  mean={out[col].mean():.4f}  std={out[col].std():.4f}",
+              flush=True)
+    _done(6, "ILR fuel-mix coordinates",
+          f"7 colonne aggiunte  |  {n_ilr_nan} righe con NaN (EIA missing)")
+
+    # ── 7. Save ──────────────────────────────────────────────────────────────
+    _step(7, "Saving output")
     out_path = Path(C.RESULTS_DIR) / "preprocessed.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_path, index=False)
-    _done(6, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(7, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
     # ── Plots ────────────────────────────────────────────────────────────────
     make_plots(out, df_clean)
