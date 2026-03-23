@@ -220,9 +220,9 @@ def main() -> None:
                         help="Aggiunge [3d] diagnostics sul vincitore (MI, persistence, interpretation, validation, justification)")
     parser.add_argument("--markov-exp",  default=None, metavar="EXP")
     parser.add_argument(
-        "--ray-address", default="auto",
+        "--ray-address", default="ray://10.4.4.7:10001",
         metavar="ADDR",
-        help="Indirizzo Ray (default: auto — da head node; usa ray://10.4.4.7:10001 da Windows)",
+        help="Indirizzo Ray (default: ray://10.4.4.7:10001; usa auto da head node)",
     )
     args    = parser.parse_args()
     exps    = args.exp
