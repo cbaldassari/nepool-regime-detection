@@ -13,11 +13,11 @@ Features produced (8 columns)
   1.  lmp                  — raw LMP $/MWh
   2.  arcsinh_lmp          — arcsinh(LMP), handles negative prices natively
   3.  log_return           — first difference of arcsinh_lmp, lag 1h
-  4.  mstl_resid_arcsinh   — MSTL residual of arcsinh_lmp (periods 24h/168h/8760h)
+  4.  mstl_resid_arcsinh   — MSTL residual of arcsinh_lmp (periods 24h/168h)
   5.  mstl_resid_lr        — MSTL residual of log_return
   6.  log_lmp_shifted      — log(LMP - min(LMP) + 1), log scale with shift for negatives
   7.  lmp_clipped          — LMP winsorized at [1st, 99th] percentile
-  8.  mstl_resid_log       — MSTL residual of log_lmp_shifted
+  8.  mstl_resid_log       — MSTL residual of log_lmp_shifted (periods 24h/168h)
 
 Experiments A-G (used in step02_embeddings.py)
 -----------------------------------------------
@@ -466,7 +466,7 @@ def main() -> pd.DataFrame:
     # All 10 series are fit in parallel (joblib) — ~10x faster than sequential.
     # Price series: 3 fits.  ILR series: 7 fits.  Total: 10 fits.
     # NaN in ILR raw cols are filled with median before fitting, then restored.
-    _step(6, "MSTL deseasonalization  (10 serie in parallelo, periodi: 24h/168h/8760h)")
+    _step(6, "MSTL deseasonalization  (10 serie in parallelo, periodi: 24h/168h)")
     from statsmodels.tsa.seasonal import MSTL
     from joblib import Parallel, delayed
 
@@ -489,8 +489,8 @@ def main() -> pd.DataFrame:
         nan_mask = out[src_col].isna() if is_ilr else None
         fill_val = out[src_col].median() if is_ilr else 0.0
         series   = out[src_col].fillna(fill_val).values
-        res      = MSTL(series, periods=[24, 168, 8760],
-                        windows=[25, 169, 8761]).fit()
+        res      = MSTL(series, periods=[24, 168],
+                        windows=[25, 169]).fit()
         resid    = res.resid.copy()
         if is_ilr and nan_mask is not None:
             resid[nan_mask.values] = np.nan
@@ -561,7 +561,7 @@ def main() -> pd.DataFrame:
     print("  Price features:")
     print("    lmp, arcsinh_lmp, log_return — raw price dynamics.")
     print("    log_lmp_shifted, lmp_clipped — log-scale and clipped alternatives.")
-    print("    mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log — MSTL residuals (seasonal removed).")
+    print("    mstl_resid_arcsinh, mstl_resid_lr, mstl_resid_log — MSTL residuals (24h/168h seasonal removed).")
     print()
     print(feat.describe().round(3).to_string())
 
