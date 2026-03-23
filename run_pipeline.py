@@ -39,6 +39,7 @@ Uso
   python run_pipeline.py --diagnostics          # aggiunge [3d] diagnostics sul vincitore
   python run_pipeline.py --markov-exp D         # forza esperimento per Markov/alt-clustering/diagnostics
   python run_pipeline.py --ray-address auto     # connetti a cluster Ray esterno
+  python run_pipeline.py --cluster-dir /data/nepool-regime-detection  # path progetto sui nodi Linux
 """
 
 from __future__ import annotations
@@ -192,7 +193,8 @@ def read_winner() -> str | None:
     if not p.exists():
         return None
     with open(p) as f:
-        return json.load(f).get("winner")
+        d = json.load(f)
+        return d.get("winner_exp") or d.get("winner")
 
 
 def _header(msg: str) -> None:
@@ -223,6 +225,12 @@ def main() -> None:
                         help="Aggiunge [3d] diagnostics sul vincitore (MI, persistence, interpretation, validation, justification)")
     parser.add_argument("--markov-exp",  default=None, metavar="EXP")
     parser.add_argument(
+        "--cluster-dir", default=None, metavar="PATH",
+        help="Path del progetto SUI NODI del cluster (Linux). Necessario quando si lancia\n"
+             "da client Windows. Es: /home/ubuntu/nepool-regime-detection\n"
+             "Se omesso usa lo stesso path di questo script.",
+    )
+    parser.add_argument(
         "--ray-address", default="ray://10.4.4.7:10001",
         metavar="ADDR",
         help="Indirizzo Ray (default: ray://10.4.4.7:10001; usa auto da head node)",
@@ -232,9 +240,13 @@ def main() -> None:
     t_start = time.time()
     failed  = []
 
+    # Radice del progetto sui nodi cluster (Linux) — può differire dal client Windows.
+    # Su nodi Linux i path backslash non funzionano, quindi usiamo posixpath.
+    _cluster_root = args.cluster_dir or str(PROJECT_DIR)
+
     def S(name):
-        """Path assoluto di uno script nella directory del progetto."""
-        return str(PROJECT_DIR / name)
+        """Path assoluto di uno script: usa cluster_dir sui nodi Ray, PROJECT_DIR in locale."""
+        return _cluster_root.rstrip("/\\") + "/" + name
 
     # ── Init Ray ─────────────────────────────────────────────────────────────
     import ray
@@ -249,7 +261,8 @@ def main() -> None:
         f"NEPOOL Regime Detection — Ray Pipeline\n"
         f"  Esperimenti : {exps}\n"
         f"  Ray cluster : CPU={resources.get('CPU', '?'):.0f}"
-        f"  GPU={resources.get('GPU', 0):.0f}"
+        f"  GPU={resources.get('GPU', 0):.0f}\n"
+        f"  Script dir  : {_cluster_root}"
     )
 
     ray_run = _make_ray_run()
