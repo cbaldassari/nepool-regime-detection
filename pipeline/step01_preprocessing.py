@@ -496,10 +496,12 @@ def main() -> pd.DataFrame:
             resid[nan_mask.values] = np.nan
         return dst_col, resid
 
-    results = Parallel(n_jobs=-1, prefer="threads")(
+    gen = Parallel(n_jobs=-1, prefer="threads", return_as="generator")(
         delayed(_fit_mstl)(src, dst, ilr_flag)
         for src, dst, ilr_flag in mstl_jobs
     )
+    results = list(tqdm(gen, total=len(mstl_jobs), desc="  MSTL", unit="serie",
+                        ncols=70, leave=True))
     for dst_col, resid in results:
         out[dst_col] = resid
         print(f"    -> {dst_col}  (resid std={np.nanstd(resid):.4f})", flush=True)
