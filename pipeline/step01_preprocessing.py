@@ -356,7 +356,7 @@ def main() -> pd.DataFrame:
     print("    • mstl_resid_arcsinh, mstl_resid_lr")
     print("─" * 65)
 
-    n_steps = 7
+    n_steps = 8
     def _step(n: int, label: str) -> None:
         print(f"  ▶ [{n}/{n_steps}] {label} ···", flush=True)
     def _done(n: int, label: str, detail: str = "") -> None:
@@ -477,12 +477,34 @@ def main() -> pd.DataFrame:
     _done(6, "ILR fuel-mix coordinates",
           f"7 colonne aggiunte  |  {n_ilr_nan} righe con NaN (EIA missing)")
 
-    # ── 7. Save ──────────────────────────────────────────────────────────────
-    _step(7, "Saving output")
+    # ── 6b. MSTL deseasonalisation of ILR coordinates ────────────────────────
+    # ILR coordinates carry strong seasonal signals:
+    #   ilr_7 (solar vs wind) → near-deterministic 24h cycle (solar = 0 at night)
+    #   ilr_6 (hydro vs intermittent) → strong annual cycle (spring snowmelt)
+    #   ilr_1 (dispatch vs variable) → weekly + annual cycles
+    # We remove the same three periods used for price features (24h/168h/8760h)
+    # and store the residuals as mstl_resid_ilr_1…7 alongside the raw ilr_1…7.
+    _step(7, "MSTL deseasonalisation of ILR  (periodi: 24h, 168h, 8760h)")
+    from statsmodels.tsa.seasonal import MSTL as _MSTL
+    for raw_col in ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]:
+        dst_col = f"mstl_resid_{raw_col}"
+        series  = out[raw_col].fillna(out[raw_col].median()).values
+        mstl    = _MSTL(series, periods=[24, 168, 8760], windows=[25, 169, 8761])
+        res     = mstl.fit()
+        out[dst_col] = res.resid
+        # Propagate NaN from the raw column to the residual
+        out.loc[out[raw_col].isna(), dst_col] = np.nan
+        print(f"    {raw_col} -> {dst_col}  "
+              f"(resid std={res.resid.std():.4f})", flush=True)
+    _done(7, "MSTL ILR deseasonalisation",
+          "colonne aggiunte: mstl_resid_ilr_1 … mstl_resid_ilr_7")
+
+    # ── 8. Save ──────────────────────────────────────────────────────────────
+    _step(8, "Saving output")
     out_path = Path(C.RESULTS_DIR) / "preprocessed.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_path, index=False)
-    _done(7, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
+    _done(8, "Saving output", f"{out_path.stat().st_size / 1e6:.1f} MB  →  {out_path}")
 
     # ── Plots ────────────────────────────────────────────────────────────────
     make_plots(out, df_clean)

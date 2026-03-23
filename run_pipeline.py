@@ -46,7 +46,9 @@ from pathlib import Path
 # =============================================================================
 
 PYTHON      = sys.executable
-ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+ALL_EXPS    = ["A", "B", "C", "D", "E", "F", "G", "H", "I",
+               "J", "K", "L",   # ILR raw ablation
+               "M", "N", "O"]   # ILR detrended ablation
 RESULTS_DIR = Path("results")
 
 # Directory del progetto — usata per costruire path assoluti degli script

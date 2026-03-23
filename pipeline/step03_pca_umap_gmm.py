@@ -70,7 +70,9 @@ warnings.filterwarnings("ignore")
 # Passa da linea di comando:  python step03f_pca_umap_gmm.py --exp A
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--exp",     default="A", choices=["A","B","C","D","E","F","G","H","I","J","K","L"])
+_parser.add_argument("--exp",     default="A",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
 _parser.add_argument("--no-umap", action="store_true",
                      help="Salta UMAP: GMM gira direttamente su PCA(20D)")
 _args      = _parser.parse_known_args()[0]

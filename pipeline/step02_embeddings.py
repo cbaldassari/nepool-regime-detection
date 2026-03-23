@@ -75,34 +75,48 @@ MAX_RETRIES   = 3                           # Ray actor retries on node failure
 #   D -> mstl_resid_arcsinh  (MSTL residuo di arcsinh_lmp)
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--exp", default="A", choices=["A","B","C","D","E","F","G","H","I","J","K","L"])
+_parser.add_argument("--exp", default="A",
+                     choices=["A","B","C","D","E","F","G","H","I",
+                              "J","K","L","M","N","O"])
 EXPERIMENT = _parser.parse_known_args()[0].exp
 
-_ILR_COLS = ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]
+_ILR_RAW = ["ilr_1", "ilr_2", "ilr_3", "ilr_4", "ilr_5", "ilr_6", "ilr_7"]
+_ILR_DET = ["mstl_resid_ilr_1", "mstl_resid_ilr_2", "mstl_resid_ilr_3",
+            "mstl_resid_ilr_4", "mstl_resid_ilr_5", "mstl_resid_ilr_6",
+            "mstl_resid_ilr_7"]
 
 # _CHRONOS_MAP: feature channel(s) fed into Chronos-2 for each experiment.
-# None = skip Chronos-2 entirely (ILR-only experiment J).
+# None = skip Chronos-2 entirely (ILR-only experiments J, M).
 _CHRONOS_MAP = {
     # ── Price only (univariate) A–I ──────────────────────────────────────────
-    "A": ["log_return"],            # stationary return (arcsinh diff)
+    "A": ["log_return"],            # stationary return
     "B": ["arcsinh_lmp"],           # price level, negative-safe
     "C": ["mstl_resid_lr"],         # deseasonalized return
     "D": ["mstl_resid_arcsinh"],    # deseasonalized level (TOPSIS winner)
-    "E": ["log_lmp_shifted"],       # log-scale level (alt. to arcsinh)
-    "F": ["lmp_clipped"],           # raw level without extreme spikes
+    "E": ["log_lmp_shifted"],       # log-scale level
+    "F": ["lmp_clipped"],           # winsorized level
     "G": ["mstl_resid_log"],        # deseasonalized log-level
-    "H": ["quantile_transform"],    # distribution-free normal mapping
+    "H": ["quantile_transform"],    # distribution-free mapping
     "I": ["rolling_zscore_24h"],    # adaptive local normalization
-    # ── ILR ablation J–L: Chronos input (price only, ILR appended after) ────
-    "J": None,                      # ILR only — no Chronos-2
-    "K": ["log_return"],            # Chronos(log_return)  ‖ ILR
-    "L": ["mstl_resid_arcsinh"],    # Chronos(mstl_resid)  ‖ ILR
+    # ── ILR ablation — raw ILR (J–L) ─────────────────────────────────────────
+    "J": None,                      # ILR raw only        (no Chronos-2)
+    "K": ["log_return"],            # Chronos(log_return)  ‖ ILR raw
+    "L": ["mstl_resid_arcsinh"],    # Chronos(mstl_resid)  ‖ ILR raw
+    # ── ILR ablation — detrended ILR (M–O) ───────────────────────────────────
+    "M": None,                      # ILR detrended only  (no Chronos-2)
+    "N": ["log_return"],            # Chronos(log_return)  ‖ ILR detrended
+    "O": ["mstl_resid_arcsinh"],    # Chronos(mstl_resid)  ‖ ILR detrended
 }
-# Experiments that concatenate ILR AFTER the Chronos-2 embedding
-_APPEND_ILR = {"J", "K", "L"}
 
-# Feature cols used for sliding-window construction (and Chronos-2 input).
-# For J we build windows on log_return just to obtain timestamps; Chronos is skipped.
+# Which ILR columns to append for each ablation experiment
+_ILR_COLS_MAP = {
+    "J": _ILR_RAW, "K": _ILR_RAW, "L": _ILR_RAW,
+    "M": _ILR_DET, "N": _ILR_DET, "O": _ILR_DET,
+}
+_APPEND_ILR = set(_ILR_COLS_MAP.keys())
+
+# Feature cols for sliding-window construction (Chronos-2 input).
+# For J/M we build windows on log_return only to obtain timestamps.
 FEAT_COLS = _CHRONOS_MAP[EXPERIMENT] or ["log_return"]
 EXP_DIR    = Path(C.RESULTS_DIR) / f"exp_{EXPERIMENT}"
 
@@ -646,7 +660,8 @@ def make_plots(emb_df: pd.DataFrame) -> None:
 
 def append_ilr(embeddings: np.ndarray,
                timestamps: np.ndarray,
-               pre: pd.DataFrame) -> np.ndarray:
+               pre: pd.DataFrame,
+               ilr_cols: list[str] | None = None) -> np.ndarray:
     """
     Concatenate ILR coordinates to the embedding matrix.
 
@@ -663,7 +678,9 @@ def append_ilr(embeddings: np.ndarray,
     pre        : preprocessed.parquet as DataFrame (must have ILR cols)
     returns    : (N, D_model + 7)
     """
-    pre_ilr = pre.set_index("datetime")[_ILR_COLS]
+    if ilr_cols is None:
+        ilr_cols = _ILR_RAW
+    pre_ilr = pre.set_index("datetime")[ilr_cols]
     ts      = pd.to_datetime(timestamps)
     ilr_mat = pre_ilr.reindex(ts).values.astype(np.float32)   # (N, 7)
 
@@ -753,7 +770,8 @@ def main() -> pd.DataFrame:
     # ── 3b. ILR concatenation (exp J / K / L) ────────────────────────────────
     if EXPERIMENT in _APPEND_ILR:
         _step(4, f"Concatenate ILR  [ emb_t ‖ ILR_t ]  (exp {EXPERIMENT})")
-        embeddings = append_ilr(embeddings, timestamps, out)
+        embeddings = append_ilr(embeddings, timestamps, out,
+                                ilr_cols=_ILR_COLS_MAP[EXPERIMENT])
         _done(4, "ILR concatenated",
               f"shape ({N}, {embeddings.shape[1]})  "
               f"= {embeddings.shape[1] - 7} Chronos + 7 ILR"
