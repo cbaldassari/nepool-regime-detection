@@ -214,6 +214,8 @@ def main() -> None:
         "--exp", nargs="+", default=ALL_EXPS,
         choices=ALL_EXPS, metavar="EXP",  # A-I: price only; J-L: ILR ablation
     )
+    parser.add_argument("--probe", action="store_true",
+                        help="Esegue un task Ray su ogni nodo e stampa home dir + cerca il progetto")
     parser.add_argument("--skip-preproc", action="store_true",
                         help="Salta step01 (preprocessing già fatto)")
     parser.add_argument("--skip-emb",    action="store_true")
@@ -266,6 +268,37 @@ def main() -> None:
     )
 
     ray_run = _make_ray_run()
+
+    # ── Probe (opzionale) ─────────────────────────────────────────────────────
+    if args.probe:
+        import ray as _ray
+
+        @_ray.remote
+        def _probe_node():
+            import os, socket, subprocess
+            hostname = socket.gethostname()
+            home     = os.path.expanduser("~")
+            # cerca run_pipeline.py nelle dir più comuni
+            search   = subprocess.run(
+                ["find", "/", "-name", "run_pipeline.py", "-maxdepth", "8",
+                 "!", "-path", "*/proc/*", "!", "-path", "*/sys/*"],
+                capture_output=True, text=True, timeout=20,
+            )
+            found = [l.strip() for l in search.stdout.splitlines() if l.strip()]
+            return hostname, home, found
+
+        print("\n  Probe in corso su 3 nodi...", flush=True)
+        futs = [_probe_node.remote() for _ in range(3)]
+        for hostname, home, found in _ray.get(futs):
+            print(f"\n  [{hostname}]  home={home}", flush=True)
+            if found:
+                for p in found:
+                    print(f"    run_pipeline.py trovato → {p}", flush=True)
+                    print(f"    → --cluster-dir {os.path.dirname(p)}", flush=True)
+            else:
+                print("    run_pipeline.py NON trovato sul nodo", flush=True)
+        ray.shutdown()
+        return
 
     # ── Info cluster ─────────────────────────────────────────────────────────
     nodes = ray.nodes()
